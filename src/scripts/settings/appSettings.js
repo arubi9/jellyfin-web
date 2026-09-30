@@ -88,6 +88,22 @@ class AppSettings {
         }
     }
 
+    /**
+     * Get or set the last automatically detected streaming bitrate.
+     * Kept apart from maxStreamingBitrate, which can also hold a manually selected value.
+     * @param {boolean} isInNetwork - Whether the server is in the local network.
+     * @param {number|undefined} val - Detected bitrate or undefined.
+     * @return {number|null} The last detected bitrate, or null if none was saved.
+     */
+    detectedBitrate(isInNetwork, val) {
+        const key = 'detectedbitrate-' + isInNetwork;
+        if (val !== undefined) {
+            this.set(key, val);
+        }
+
+        return parseInt(this.get(key) || '0', 10) || null;
+    }
+
     maxStaticMusicBitrate(val) {
         if (val !== undefined) {
             this.set('maxStaticMusicBitrate', val);

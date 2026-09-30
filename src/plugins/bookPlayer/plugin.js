@@ -11,6 +11,7 @@ import keyboardnavigation from '../../scripts/keyboardNavigation';
 import dialogHelper from '../../components/dialogHelper/dialogHelper';
 import TableOfContents from './tableOfContents';
 import BookOsd from './BookOsd/BookOsd';
+import { loadBookLocations, saveBookLocations } from './locationsCache';
 import { translateHtml } from '../../lib/globalize';
 import * as userSettings from '../../scripts/settings/userSettings';
 import Events from '../../utils/events.ts';
@@ -29,6 +30,8 @@ const THEMES = {
 };
 const THEME_ORDER = ['dark', 'sepia', 'light'];
 const FONT_SIZES = ['x-small', 'small', 'medium', 'large', 'x-large'];
+// number of characters per generated location
+const LOCATION_CHARS = 1024;
 
 export class BookPlayer {
     constructor() {
@@ -53,6 +56,8 @@ export class BookPlayer {
         this.onWindowKeyDown = this.onWindowKeyDown.bind(this);
         this.addSwipeGestures = this.addSwipeGestures.bind(this);
         this.toggleFullscreen = this.toggleFullscreen.bind(this);
+        this.onRenderedForwardEvents = (e, i) => this.forwardEvents(i.document);
+        this.onRenderedAddSwipeGestures = (e, i) => this.addSwipeGestures(i.document.documentElement);
     }
 
     play(options) {
@@ -80,6 +85,7 @@ export class BookPlayer {
         const elem = this.mediaElement;
         const tocElement = this.tocElement;
         const rendition = this.rendition;
+        const book = this.book;
 
         if (elem) {
             dialogHelper.close(elem);
@@ -91,8 +97,18 @@ export class BookPlayer {
             this.tocElement = null;
         }
 
-        if (rendition) {
-            rendition.destroy();
+        this.rendition = null;
+        this.book = null;
+
+        try {
+            if (book) {
+                // also destroys the rendition and releases the epub archive
+                book.destroy();
+            } else if (rendition) {
+                rendition.destroy();
+            }
+        } catch (err) {
+            console.error('[BookPlayer] failed to destroy book', err);
         }
 
         // hide loader in case player was not fully loaded yet
@@ -187,22 +203,23 @@ export class BookPlayer {
 
         document.addEventListener('keydown', this.onWindowKeyDown);
         this.rendition?.on('keydown', this.onWindowKeyDown);
-        this.rendition?.on('rendered', (e, i) => this.forwardEvents(i.document));
+        this.rendition?.on('rendered', this.onRenderedForwardEvents);
 
         if (browser.safari) {
             this.addSwipeGestures(document.querySelector('#bookPlayerContainer'));
         } else {
-            this.rendition?.on('rendered', (e, i) => this.addSwipeGestures(i.document.documentElement));
+            this.rendition?.on('rendered', this.onRenderedAddSwipeGestures);
         }
     }
 
     unbindEvents() {
         document.removeEventListener('keydown', this.onWindowKeyDown);
         this.rendition?.off('keydown', this.onWindowKeyDown);
+        this.rendition?.off('rendered', this.onRenderedForwardEvents);
         this.mediaElement?.removeEventListener('close', this.onDialogClosed);
 
         if (!browser.safari) {
-            this.rendition?.off('rendered', (e, i) => this.addSwipeGestures(i.document.documentElement));
+            this.rendition?.off('rendered', this.onRenderedAddSwipeGestures);
         }
 
         this.touchHelper?.destroy();
@@ -347,35 +364,87 @@ export class BookPlayer {
 
                 this.currentSrc = () => downloadHref;
                 this.rendition = rendition;
+                this.book = book;
 
-                return rendition.display().then(() => {
+                const isCancelled = () => this.cancellationToken || this.book !== book;
+                let locationsReady = false;
+                let locationsVersion;
+
+                const generateLocations = () => {
+                    return book.locations.generate(LOCATION_CHARS).then(() => {
+                        if (isCancelled()) return;
+                        locationsReady = true;
+                        saveBookLocations(item.Id, locationsVersion, book.locations.save());
+                    }).catch((err) => {
+                        if (!isCancelled()) {
+                            console.error('[BookPlayer] failed to generate locations', err);
+                        }
+                    });
+                };
+
+                return rendition.display().then(async () => {
+                    if (isCancelled()) return reject();
+
                     const epubElem = document.querySelector('.epub-container');
                     epubElem.style.opacity = '0';
 
                     this.bindEvents();
 
-                    return this.rendition.book.locations.generate(1024).then(async () => {
-                        if (this.cancellationToken) reject();
+                    // Locations are needed to convert between progress and position, generating them parses the whole book
+                    const metadata = book.packaging?.metadata || {};
+                    locationsVersion = [LOCATION_CHARS, metadata.identifier, metadata.modified_date].join('|');
+                    const cachedLocations = loadBookLocations(item.Id, locationsVersion);
+                    if (cachedLocations) {
+                        book.locations.load(cachedLocations);
+                        locationsReady = true;
+                    }
 
-                        const percentageTicks = options.startPositionTicks / 10000000;
-                        if (percentageTicks !== 0.0) {
+                    const percentageTicks = options.startPositionTicks / 10000000;
+                    if (percentageTicks !== 0.0) {
+                        // The resume position can only be found with the locations
+                        if (!locationsReady) await generateLocations();
+                        if (isCancelled()) return reject();
+
+                        if (locationsReady) {
                             const resumeLocation = book.locations.cfiFromPercentage(percentageTicks);
-                            await rendition.display(resumeLocation);
+                            try {
+                                await rendition.display(resumeLocation);
+                            } catch (err) {
+                                console.error('[BookPlayer] failed to display resume location', err);
+                            }
+                            if (isCancelled()) return reject();
                         }
+                    }
 
-                        this.loaded = true;
-                        epubElem.style.opacity = '';
-                        rendition.on('relocated', (locations) => {
-                            this.progress = book.locations.percentageFromCfi(locations.start.cfi);
-                            Events.trigger(this, 'pause');
-                        });
-
-                        this.setTheme(this.theme, this.fontSize);
-                        loading.hide();
-                        return resolve();
+                    this.loaded = true;
+                    epubElem.style.opacity = '';
+                    rendition.on('relocated', (locations) => {
+                        const start = locations.start;
+                        // Estimate from the chapter until the locations are generated
+                        this.progress = locationsReady ?
+                            book.locations.percentageFromCfi(start.cfi) :
+                            (start.index || 0) / (book.spine.length || 1);
+                        Events.trigger(this, 'pause');
                     });
+
+                    this.setTheme(this.theme, this.fontSize);
+                    loading.hide();
+                    resolve();
+
+                    if (!locationsReady) {
+                        // Generate the locations in the background, the book is already readable
+                        generateLocations().then(() => {
+                            const cfi = rendition.location?.start?.cfi;
+                            if (locationsReady && cfi) {
+                                this.progress = book.locations.percentageFromCfi(cfi);
+                            }
+                        });
+                    }
                 }, () => {
                     console.error('failed to display epub');
+                    return reject();
+                }).catch((err) => {
+                    console.error('[BookPlayer] failed to load epub', err);
                     return reject();
                 });
             });

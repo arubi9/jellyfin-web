@@ -264,7 +264,9 @@
     position: absolute;
     width: 2px;
     height: 12px;
-    transform: translate3d(0, 25%, 0);
+
+    /* 'left' is set in percent by emby-slider, center the marker on it without measuring */
+    transform: translate3d(-50%, 25%, 0);
 }
 
 .sliderMarker.unwatched {

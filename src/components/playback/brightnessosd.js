@@ -49,9 +49,17 @@ function onHideComplete() {
 
 let hideTimeout;
 function showOsd() {
-    clearHideTimeout();
-
     const elem = osdElement;
+
+    // Already fully shown (the hide timer only runs then): just restart the hide timer,
+    // no need for a forced reflow and an animation frame on every change
+    if (hideTimeout && !elem.classList.contains('hide') && !elem.classList.contains('iconOsd-hidden')) {
+        clearHideTimeout();
+        hideTimeout = setTimeout(hideOsd, 3000);
+        return;
+    }
+
+    clearHideTimeout();
 
     dom.removeEventListener(elem, dom.whichTransitionEvent(), onHideComplete, {
         once: true
@@ -65,6 +73,8 @@ function showOsd() {
     requestAnimationFrame(function () {
         elem.classList.remove('iconOsd-hidden');
 
+        // A previous showOsd may have scheduled a timer in the meantime
+        clearHideTimeout();
         hideTimeout = setTimeout(hideOsd, 3000);
     });
 }

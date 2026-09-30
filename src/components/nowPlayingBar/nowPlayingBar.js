@@ -28,6 +28,11 @@ let currentTimeElement;
 let nowPlayingImageElement;
 let nowPlayingImageUrl;
 let nowPlayingTextElement;
+let nowPlayingText;
+/** Key of the item the user data buttons and context menu were rendered for (or are being fetched for). */
+let nowPlayingUserDataKey;
+/** Incremented for every item request, to ignore responses that arrive out of order. */
+let nowPlayingItemRequestId = 0;
 let nowPlayingUserData;
 let muteButton;
 let volumeSlider;
@@ -116,6 +121,9 @@ function onSlideDownComplete() {
 }
 
 function slideDown(elem) {
+    // Render the user data of the next item again (it may have changed in the meantime)
+    nowPlayingUserDataKey = null;
+
     // trigger reflow
     void elem.offsetWidth;
 
@@ -130,6 +138,11 @@ function slideUp(elem) {
     dom.removeEventListener(elem, dom.whichTransitionEvent(), onSlideDownComplete, {
         once: true
     });
+
+    // Already shown: nothing to animate (this runs on every state change)
+    if (!elem.classList.contains('hide') && !elem.classList.contains('nowPlayingBar-hidden')) {
+        return;
+    }
 
     elem.classList.remove('hide');
 
@@ -473,10 +486,7 @@ function setLyricButtonActiveStatus() {
     lyricButton.classList.toggle('buttonActive', isLyricPageActive);
 }
 
-function updateNowPlayingInfo(state) {
-    const nowPlayingItem = state.NowPlayingItem;
-
-    const textLines = nowPlayingItem ? getItemTextLines(nowPlayingItem) : undefined;
+function renderNowPlayingText(textLines) {
     nowPlayingTextElement.innerHTML = '';
     if (textLines) {
         const itemText = document.createElement('div');
@@ -495,6 +505,19 @@ function updateNowPlayingInfo(state) {
         }
         nowPlayingTextElement.appendChild(itemText);
         nowPlayingTextElement.appendChild(secondaryText);
+    }
+}
+
+function updateNowPlayingInfo(state) {
+    const nowPlayingItem = state.NowPlayingItem;
+
+    const textLines = nowPlayingItem ? getItemTextLines(nowPlayingItem) : undefined;
+
+    // Only rebuild the text when it changes (this runs on every state change)
+    const text = textLines ? JSON.stringify(textLines) : null;
+    if (text !== nowPlayingText) {
+        nowPlayingText = text;
+        renderNowPlayingText(textLines);
     }
 
     const imgHeight = 70;
@@ -518,8 +541,21 @@ function updateNowPlayingInfo(state) {
     }
 
     if (nowPlayingItem.Id) {
+        // The item, the user data buttons and the context menu only need to be fetched/rendered once per item
+        const userDataKey = nowPlayingItem.ServerId + '|' + nowPlayingItem.Id;
+        if (userDataKey === nowPlayingUserDataKey) {
+            return;
+        }
+        nowPlayingUserDataKey = userDataKey;
+        const requestId = ++nowPlayingItemRequestId;
+
         const apiClient = ServerConnections.getApiClient(nowPlayingItem.ServerId);
         apiClient.getItem(apiClient.getCurrentUserId(), nowPlayingItem.Id).then(function (item) {
+            // Ignore responses for an item that isn't playing anymore
+            if (requestId !== nowPlayingItemRequestId) {
+                return;
+            }
+
             const userData = item.UserData || {};
             const likes = userData.Likes == null ? '' : userData.Likes;
             if (!layoutManager.mobile) {
@@ -536,6 +572,10 @@ function updateNowPlayingInfo(state) {
                     positionTo: contextButton
                 };
                 apiClient.getCurrentUser().then(function (user) {
+                    if (requestId !== nowPlayingItemRequestId) {
+                        return;
+                    }
+
                     contextButton.addEventListener('click', function () {
                         itemContextMenu.show(Object.assign({
                             item: item,
@@ -546,8 +586,16 @@ function updateNowPlayingInfo(state) {
                 });
             }
             nowPlayingUserData.innerHTML = '<button is="emby-ratingbutton" type="button" class="mediaButton paper-icon-button-light" data-id="' + item.Id + '" data-serverid="' + item.ServerId + '" data-itemtype="' + item.Type + '" data-likes="' + likes + '" data-isfavorite="' + (userData.IsFavorite) + '"><span class="material-icons favorite" aria-hidden="true"></span></button>';
+        }).catch(function (err) {
+            // Retry on the next update
+            if (requestId === nowPlayingItemRequestId) {
+                nowPlayingUserDataKey = null;
+            }
+            console.error('[nowPlayingBar] failed to get the now playing item', err);
         });
     } else {
+        nowPlayingUserDataKey = null;
+        nowPlayingItemRequestId++;
         nowPlayingUserData.innerHTML = '';
     }
 }

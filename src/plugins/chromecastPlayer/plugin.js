@@ -64,6 +64,12 @@ const PLAYER_STATE = {
 
 const messageNamespace = 'urn:x-cast:com.connectsdk';
 
+/**
+ * Maximum number of attempts to initialize the player while waiting for the Cast API to become available.
+ * Attempts are made every second.
+ */
+const MAX_INIT_ATTEMPTS = 30;
+
 class CastPlayer {
     constructor() {
         /* device variables */
@@ -84,6 +90,12 @@ class CastPlayer {
         // bind once - commit 2ebffc2271da0bc5e8b13821586aee2a2e3c7753
         this.errorHandler = this.onError.bind(this);
         this.mediaStatusUpdateHandler = this.onMediaStatusUpdate.bind(this);
+        this.messageListenerHandler = this.messageListener.bind(this);
+        this.sessionMediaListenerHandler = this.sessionMediaListener.bind(this);
+        this.sessionUpdateListenerHandler = this.sessionUpdateListener.bind(this);
+
+        this.initAttempts = 0;
+        this.initTimeout = null;
 
         this.initializeCastPlayer();
     }
@@ -102,7 +114,20 @@ class CastPlayer {
         }
 
         if (!chrome.cast?.isAvailable) {
-            setTimeout(this.initializeCastPlayer.bind(this), 1000);
+            if (this.initTimeout) {
+                // Already waiting for the Cast API
+                return;
+            }
+
+            if (++this.initAttempts > MAX_INIT_ATTEMPTS) {
+                console.warn('Not initializing chromecast: chrome.cast is not available');
+                return;
+            }
+
+            this.initTimeout = setTimeout(() => {
+                this.initTimeout = null;
+                this.initializeCastPlayer();
+            }, 1000);
             return;
         }
 
@@ -235,12 +260,16 @@ class CastPlayer {
     }
 
     onSessionConnected(session) {
+        // The same session can be connected more than once (e.g. auto-join), don't add the listeners twice
+        this.removeSessionListeners(this.session);
+        this.removeSessionListeners(session);
+
         this.session = session;
         this.deviceState = DEVICE_STATE.ACTIVE;
 
-        this.session.addMessageListener(messageNamespace, this.messageListener.bind(this));
-        this.session.addMediaListener(this.sessionMediaListener.bind(this));
-        this.session.addUpdateListener(this.sessionUpdateListener.bind(this));
+        this.session.addMessageListener(messageNamespace, this.messageListenerHandler);
+        this.session.addMediaListener(this.sessionMediaListenerHandler);
+        this.session.addUpdateListener(this.sessionUpdateListenerHandler);
 
         document.addEventListener('volumeupbutton', onVolumeUpKeyDown, false);
         document.addEventListener('volumedownbutton', onVolumeDownKeyDown, false);
@@ -250,6 +279,20 @@ class CastPlayer {
             options: {},
             command: 'Identify'
         });
+    }
+
+    /**
+     * Removes the listeners added to a session by onSessionConnected.
+     * @param {Object} session A chrome.cast.Session object
+     */
+    removeSessionListeners(session) {
+        if (!session) {
+            return;
+        }
+
+        session.removeMessageListener?.(messageNamespace, this.messageListenerHandler);
+        session.removeMediaListener?.(this.sessionMediaListenerHandler);
+        session.removeUpdateListener?.(this.sessionUpdateListenerHandler);
     }
 
     /**
@@ -543,7 +586,9 @@ function initializeChromecast() {
     Events.on(instance._castPlayer, 'playbackstart', function (e, data) {
         console.debug('[chromecastPlayer] playbackstart');
 
-        instance._castPlayer.initializeCastPlayer();
+        if (!instance._castPlayer.isInitialized) {
+            instance._castPlayer.initializeCastPlayer();
+        }
 
         const state = instance.getPlayerStateInternal(data);
         Events.trigger(instance, 'playbackstart', [state]);

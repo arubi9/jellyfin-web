@@ -8,6 +8,12 @@ import { PluginType } from 'constants/pluginType';
 import { ServerConnections } from 'lib/jellyfin-apiclient';
 import Events from 'utils/events';
 
+/**
+ * Interval of the periodic session updates sent by the server, in milliseconds.
+ * State changes (play/pause/seek/queue) are still pushed immediately by the server.
+ */
+const SESSIONS_UPDATE_INTERVAL = 2000;
+
 function getActivePlayerId() {
     const info = playbackManager.getPlayerInfo();
     return info ? info.id : null;
@@ -239,7 +245,7 @@ function subscribeToPlayerUpdates(instance) {
     instance._unsubscribeSessions = apiClient.subscribe(
         [OutboundWebSocketMessageType.Sessions],
         ({ Data }) => processUpdatedSessions(instance, Data ?? [], apiClient),
-        { [OutboundWebSocketMessageType.Sessions]: new PeriodicListenerInterval(100, 800) }
+        { [OutboundWebSocketMessageType.Sessions]: new PeriodicListenerInterval(100, SESSIONS_UPDATE_INTERVAL) }
     );
 }
 

@@ -34,7 +34,10 @@ import {
     handleHlsJsMediaError,
     getSavedVolume,
     isValidDuration,
-    getBufferedRanges
+    getBufferedRanges,
+    cancelSeekOnPlaybackStart,
+    findActiveTrackEvent,
+    loadHlsJs
 } from '../../components/htmlMediaHelper';
 import itemHelper from '../../components/itemHelper';
 import globalize from '../../lib/globalize';
@@ -68,6 +71,56 @@ function resolveUrl(url) {
         };
         xhr.send(null);
     });
+}
+
+/**
+ * Resolved subtitle worker URLs (per URL), only needed on Tizen.
+ * @type {Map<string, Promise<string>>}
+ */
+const resolvedWorkerUrls = new Map();
+
+function getWorkerUrl(url) {
+    // Worker in Tizen 5 doesn't resolve relative path with async request
+    if (!browser.tizen) {
+        return Promise.resolve(url);
+    }
+
+    let promise = resolvedWorkerUrls.get(url);
+    if (!promise) {
+        promise = resolveUrl(url);
+        resolvedWorkerUrls.set(url, promise);
+    }
+    return promise;
+}
+
+/**
+ * Fallback font names per server (null when fallback fonts are disabled).
+ * @type {Map<string, Promise<string[] | null>>}
+ */
+const fallbackFontsCache = new Map();
+
+function getFallbackFontNames(apiClient) {
+    const serverId = apiClient.serverId();
+    let promise = fallbackFontsCache.get(serverId);
+    if (!promise) {
+        promise = apiClient.getNamedConfiguration('encoding').then((config) => {
+            if (!config.EnableFallbackFont) {
+                return null;
+            }
+
+            return apiClient.getJSON(apiClient.getUrl('/FallbackFont/Fonts', {
+                ApiKey: apiClient.accessToken()
+            })).then((fontFiles = []) => fontFiles.map(font => font.Name));
+        });
+        promise.catch(() => {
+            // Retry on the next load
+            if (fallbackFontsCache.get(serverId) === promise) {
+                fallbackFontsCache.delete(serverId);
+            }
+        });
+        fallbackFontsCache.set(serverId, promise);
+    }
+    return promise;
 }
 
 function tryRemoveElement(elem) {
@@ -119,14 +172,11 @@ function enableNativeTrackSupport(mediaSource, track) {
     return true;
 }
 
-function requireHlsPlayer(callback) {
-    import('hls.js/dist/hls.js').then(({ default: hls }) => {
-        hls.DefaultConfig.lowLatencyMode = false;
-        hls.DefaultConfig.backBufferLength = Infinity;
-        hls.DefaultConfig.liveBackBufferLength = 90;
-        window.Hls = hls;
+function requireHlsPlayer(callback, onError) {
+    // Memoised import; also sets a finite backBufferLength (see htmlMediaHelper)
+    loadHlsJs().then(() => {
         callback();
-    });
+    }, onError);
 }
 
 function getMediaStreamVideoTracks(mediaSource) {
@@ -277,6 +327,21 @@ export class HtmlVideoPlayer {
      * @type {any | null | undefined}
      */
     #currentBitmapSubRenderer;
+    /**
+     * Token of the ASS renderer load in progress (cleared when the track is destroyed)
+     * @type {symbol | null}
+     */
+    #assLoadToken = null;
+    /**
+     * Token of the PGS/VobSub renderer load in progress (cleared when the track is destroyed)
+     * @type {symbol | null}
+     */
+    #bitmapSubLoadToken = null;
+    /**
+     * Last track event rendered into each custom subtitle element
+     * @type {WeakMap<HTMLElement, any>}
+     */
+    #renderedTrackEvents = new WeakMap();
     /**
      * @type {number | undefined}
      */
@@ -513,6 +578,11 @@ export class HtmlVideoPlayer {
                 .catch((error) => console.warn('[libbitsub] worker prewarm failed; renderer fallback will be used', error));
         }
 
+        // Start loading hls.js now, in parallel with the player UI setup
+        if (options.mediaSource && isHls(options.mediaSource) && enableHlsJsPlayerForCodecs(options.mediaSource, 'Video')) {
+            loadHlsJs().catch(() => { /* reported by setSrcWithHlsJs */ });
+        }
+
         const elem = await this.createMediaElement(options);
         this.#applyAspectRatio(options.aspectRatio || this.getAspectRatio());
 
@@ -570,6 +640,8 @@ export class HtmlVideoPlayer {
                     maxBufferLength: maxBufferLength,
                     maxMaxBufferLength: maxBufferLength,
                     videoPreference: { preferHDR: true },
+                    // The inline worker breaks when webpack re-minifies hls.js, so use the prebuilt worker
+                    workerPath: `${appRouter.baseUrl()}/libraries/hls.worker.js`,
                     xhrSetup(xhr) {
                         xhr.withCredentials = includeCorsCredentials;
                     }
@@ -583,7 +655,7 @@ export class HtmlVideoPlayer {
 
                 // This is needed in setCurrentTrackElement
                 this.#currentSrc = url;
-            });
+            }, reject);
         });
     }
 
@@ -605,6 +677,7 @@ export class HtmlVideoPlayer {
         destroyHlsPlayer(this);
         destroyFlvPlayer(this);
         destroyCastPlayer(this);
+        cancelSeekOnPlaybackStart(elem);
 
         let secondaryTrackValid = true;
 
@@ -1306,6 +1379,13 @@ export class HtmlVideoPlayer {
             this.endPendingSubtitleLoad(targetTrackIndex);
         }
 
+        // ASS/PGS/VobSub are only rendered as the primary track
+        if (!this.isSecondaryTrack(targetTrackIndex)) {
+            // Invalidate renderer loads still in progress
+            this.#assLoadToken = null;
+            this.#bitmapSubLoadToken = null;
+        }
+
         this.destroyCustomRenderedTrackElements(targetTrackIndex);
         this.destroyNativeTracks(videoElement, targetTrackIndex);
         this.destroyStoredTrackInfo(targetTrackIndex);
@@ -1404,11 +1484,29 @@ export class HtmlVideoPlayer {
                 availableFonts.push(apiClient.getUrl(i.DeliveryUrl));
             }
         });
-        const fallbackFontList = apiClient.getUrl('/FallbackFont/Fonts', {
-            ApiKey: apiClient.accessToken()
-        });
         const htmlVideoPlayer = this;
-        import('@jellyfin/libass-wasm').then(({ default: SubtitlesOctopus }) => {
+        const loadToken = Symbol('ass');
+        this.#assLoadToken = loadToken;
+
+        // The legacy worker is only used when WebAssembly is not supported
+        const legacyWorkerUrl = `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`;
+
+        Promise.all([
+            import('@jellyfin/libass-wasm'),
+            getFallbackFontNames(apiClient),
+            getWorkerUrl(`${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`),
+            window.WebAssembly ? legacyWorkerUrl : getWorkerUrl(legacyWorkerUrl)
+        ]).then(([{ default: SubtitlesOctopus }, fallbackFontNames, workerUrl, resolvedLegacyWorkerUrl]) => {
+            // Exit if the track was destroyed or replaced while loading
+            if (loadToken !== this.#assLoadToken || !this.#mediaElement) return;
+
+            (fallbackFontNames || []).forEach(fontName => {
+                const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(fontName)}`, {
+                    ApiKey: apiClient.accessToken()
+                });
+                availableFonts.push(fontUrl);
+            });
+
             const mediaSource = this._currentPlayOptions.mediaSource;
             const videoStream = getMediaStreamVideoTracks(mediaSource)[0];
 
@@ -1416,8 +1514,8 @@ export class HtmlVideoPlayer {
                 video: videoElement,
                 subUrl: getTextTrackUrl(track, item),
                 fonts: availableFonts,
-                workerUrl: `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker.js`,
-                legacyWorkerUrl: `${appRouter.baseUrl()}/libraries/subtitles-octopus-worker-legacy.js`,
+                workerUrl,
+                legacyWorkerUrl: resolvedLegacyWorkerUrl,
                 onError() {
                     // HACK: Clear JavascriptSubtitlesOctopus: it gets disposed when an error occurs
                     htmlVideoPlayer.#currentAssRenderer = null;
@@ -1442,29 +1540,11 @@ export class HtmlVideoPlayer {
                 renderAhead: 90
             };
 
-            Promise.all([
-                apiClient.getNamedConfiguration('encoding'),
-                // Worker in Tizen 5 doesn't resolve relative path with async request
-                resolveUrl(options.workerUrl),
-                resolveUrl(options.legacyWorkerUrl)
-            ]).then(([config, workerUrl, legacyWorkerUrl]) => {
-                options.workerUrl = workerUrl;
-                options.legacyWorkerUrl = legacyWorkerUrl;
-
-                if (config.EnableFallbackFont) {
-                    apiClient.getJSON(fallbackFontList).then((fontFiles = []) => {
-                        fontFiles.forEach(font => {
-                            const fontUrl = apiClient.getUrl(`/FallbackFont/Fonts/${encodeURIComponent(font.Name)}`, {
-                                ApiKey: apiClient.accessToken()
-                            });
-                            availableFonts.push(fontUrl);
-                        });
-                        this.#currentAssRenderer = new SubtitlesOctopus(options);
-                    });
-                } else {
-                    this.#currentAssRenderer = new SubtitlesOctopus(options);
-                }
-            });
+            this.#assLoadToken = null;
+            this.#currentAssRenderer?.dispose();
+            this.#currentAssRenderer = new SubtitlesOctopus(options);
+        }).catch((error) => {
+            console.error('[libass] failed to load the ASS renderer', error);
         });
     }
 
@@ -1491,7 +1571,14 @@ export class HtmlVideoPlayer {
                 console.debug('[libbitsub] pgs', event);
             }
         };
+        const loadToken = Symbol('pgs');
+        this.#bitmapSubLoadToken = loadToken;
         import('libbitsub').then((libbitsub) => {
+            // Exit if the track was destroyed or replaced while loading
+            if (loadToken !== this.#bitmapSubLoadToken || !this.#mediaElement) return;
+
+            this.#bitmapSubLoadToken = null;
+            this.#currentBitmapSubRenderer?.dispose();
             this.#currentBitmapSubRenderer = new libbitsub.PgsRenderer(options);
             requestAnimationFrame(() => {
                 if (this.#currentBitmapSubRenderer) {
@@ -1533,7 +1620,14 @@ export class HtmlVideoPlayer {
                 console.debug('[libbitsub] vobsub', event);
             }
         };
+        const loadToken = Symbol('vobsub');
+        this.#bitmapSubLoadToken = loadToken;
         import('libbitsub').then((libbitsub) => {
+            // Exit if the track was destroyed or replaced while loading
+            if (loadToken !== this.#bitmapSubLoadToken || !this.#mediaElement) return;
+
+            this.#bitmapSubLoadToken = null;
+            this.#currentBitmapSubRenderer?.dispose();
             this.#currentBitmapSubRenderer = new libbitsub.VobSubRenderer(options);
             requestAnimationFrame(() => {
                 if (this.#currentBitmapSubRenderer) {
@@ -1656,8 +1750,9 @@ export class HtmlVideoPlayer {
             // In IE it's not necessary anyway because changing the src seems to be enough
             try {
                 trackElement.mode = 'showing';
-                while (trackElement.cues.length) {
-                    trackElement.removeCue(trackElement.cues[0]);
+                // Snapshot the list: removing from the live list one by one can be O(n²)
+                for (const cue of Array.from(trackElement.cues)) {
+                    trackElement.removeCue(cue);
                 }
             } catch (e) {
                 console.error('error removing cue from textTrack', e);
@@ -1716,15 +1811,18 @@ export class HtmlVideoPlayer {
 
             if (trackEvents && subtitleTextElement) {
                 const ticks = timeMs * 10000;
-                let selectedTrackEvent;
-                for (const trackEvent of trackEvents) {
-                    if (trackEvent.StartPositionTicks <= ticks && trackEvent.EndPositionTicks >= ticks) {
-                        selectedTrackEvent = trackEvent;
-                        break;
-                    }
+                let selectedTrackEvent = findActiveTrackEvent(trackEvents, ticks);
+                if (!selectedTrackEvent?.Text) {
+                    selectedTrackEvent = null;
                 }
 
-                if (selectedTrackEvent?.Text) {
+                // Skip the DOM update when the displayed cue did not change
+                if (this.#renderedTrackEvents.get(subtitleTextElement) === selectedTrackEvent) {
+                    continue;
+                }
+                this.#renderedTrackEvents.set(subtitleTextElement, selectedTrackEvent);
+
+                if (selectedTrackEvent) {
                     subtitleTextElement.innerHTML = DOMPurify.sanitize(
                         normalizeTrackEventText(selectedTrackEvent.Text, true));
                     subtitleTextElement.classList.remove('hide');
@@ -1869,10 +1967,9 @@ export class HtmlVideoPlayer {
                     }
 
                     // don't animate on smart tv's, too slow
+                    // The source is loaded while the animation runs
                     if (!browser.slow && browser.supportsCssAnimation()) {
-                        return zoomIn(playerDlg).then(function () {
-                            return videoElement;
-                        });
+                        void zoomIn(playerDlg);
                     }
                 }
 

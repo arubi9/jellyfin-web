@@ -77,7 +77,7 @@ function getBackdropImageUrl(item, options, apiClient) {
     }
 
     if (item.BackdropImageTags?.length) {
-        options.index = randomInt(0, item.BackdropImageTags.length - 1);
+        options.index = options.index ?? randomInt(0, item.BackdropImageTags.length - 1);
         options.tag = item.BackdropImageTags[options.index];
         return apiClient.getScaledImageUrl(item.Id, options);
     }
@@ -86,24 +86,54 @@ function getBackdropImageUrl(item, options, apiClient) {
 }
 
 /**
+ * Gets the maximum size (in CSS pixels) of the images displayed in the slideshow.
+ * The longest screen side is used so rotating the device doesn't require a new image.
+ * The device pixel ratio is applied by the ApiClient when building the image URL.
+ * @returns {number} Maximum width and height of the displayed images.
+ */
+function getSlideshowImageMaxSize() {
+    const width = window.screen?.width || window.innerWidth || 0;
+    const height = window.screen?.height || window.innerHeight || 0;
+    return Math.round(Math.max(width, height)) || 1920;
+}
+
+/**
  * Dispatches a request for an item's image to its respective handler.
  * @param {object} item - Item used to generate the image URL.
- * @returns {string} URL of the item's image.
+ * @param {object} user - Current user.
+ * @param {number} maxSize - Maximum width and height of the displayed image, in CSS pixels.
+ * @returns {{displayImage: (string|null), fullImage: (string|null), originalImage: (string|null)}}
+ * URL of the image scaled for display, URL of the image at full resolution (used when zooming)
+ * and URL of the original file (used for download and sharing).
  */
-function getImgUrl(item, user) {
+function getImgUrls(item, user, maxSize) {
     const api = ServerConnections.getApi(item.ServerId);
     const apiClient = ServerConnections.getApiClient(item);
-    const imageOptions = {};
 
     if (item.BackdropImageTags?.length) {
-        return getBackdropImageUrl(item, imageOptions, apiClient);
-    } else {
-        if (api && item.MediaType === 'Photo' && user?.Policy.EnableContentDownloading) {
-            return getLibraryApi(api).getDownloadUrl({ itemId: item.Id });
-        }
-        imageOptions.type = 'Primary';
-        return getImageUrl(item, imageOptions, apiClient);
+        const index = randomInt(0, item.BackdropImageTags.length - 1);
+        const displayImage = getBackdropImageUrl(item, { index, maxWidth: maxSize, maxHeight: maxSize }, apiClient);
+        return {
+            displayImage,
+            fullImage: null,
+            originalImage: getBackdropImageUrl(item, { index }, apiClient)
+        };
     }
+
+    // Server scaled images are re-encoded to a web format when the browser can't render the original (e.g. HEIC)
+    const displayImage = getImageUrl(item, { type: 'Primary', maxWidth: maxSize, maxHeight: maxSize }, apiClient);
+    const fullImage = getImageUrl(item, { type: 'Primary' }, apiClient);
+    let originalImage = fullImage;
+
+    if (api && item.MediaType === 'Photo' && user?.Policy.EnableContentDownloading) {
+        originalImage = getLibraryApi(api).getDownloadUrl({ itemId: item.Id });
+    }
+
+    return {
+        displayImage: displayImage || originalImage,
+        fullImage: displayImage ? fullImage : null,
+        originalImage
+    };
 }
 
 /**
@@ -144,6 +174,8 @@ export default function (options) {
     let hideTimeout;
     /** Last coordinates of the mouse pointer. */
     let lastMouseMoveData;
+    /** Maximum size of the displayed images, in CSS pixels. */
+    let imageMaxSize;
 
     /**
      * Creates the HTML markup for the dialog and the OSD.
@@ -248,9 +280,7 @@ export default function (options) {
             }
 
             if (screenfull.isEnabled) {
-                screenfull.on('change', function () {
-                    toggleFullscreenButtons(screenfull.isFullscreen);
-                });
+                screenfull.on('change', onFullscreenChange);
             }
         }
 
@@ -277,6 +307,13 @@ export default function (options) {
         if (btnSlideshowPrevious) btnSlideshowPrevious.classList.add('hide');
         const btnSlideshowNext = dialog.querySelector('.btnSlideshowNext');
         if (btnSlideshowNext) btnSlideshowNext.classList.add('hide');
+    }
+
+    /**
+     * Updates the fullscreen buttons when the fullscreen state changes.
+     */
+    function onFullscreenChange() {
+        toggleFullscreenButtons(screenfull.isFullscreen);
     }
 
     /**
@@ -335,6 +372,27 @@ export default function (options) {
     }
 
     /**
+     * Loads the full resolution image when zooming in, as the displayed image is scaled to the screen size.
+     */
+    function onZoomChangeLoadFullImage(swiper, scale, imageEl, slideEl) {
+        const fullImage = slideEl?.getAttribute('data-fullimage');
+
+        if (scale > 1 && fullImage) {
+            slideEl.removeAttribute('data-fullimage');
+
+            const image = slideEl.querySelector('.swiper-slide-img');
+            if (image) {
+                image.src = fullImage;
+            }
+
+            const zoomImage = slideEl.querySelector('.swiper-zoom-fakeimg');
+            if (zoomImage) {
+                zoomImage.style.backgroundImage = `url('${fullImage}')`;
+            }
+        }
+    }
+
+    /**
      * Initializes the Swiper instance and binds the relevant events.
      * @param {HTMLElement} dialog - Element containing the dialog.
      * @param {Object} options - Options used to initialize the Swiper instance.
@@ -374,9 +432,10 @@ export default function (options) {
                     prevEl: '.btnSlideshowPrevious'
                 },
                 // Virtual slides reduce memory consumption for large libraries while allowing preloading of images;
+                // the cache is disabled so visited slides (and their decoded images) can be released.
                 virtual: {
                     slides: slides,
-                    cache: true,
+                    cache: false,
                     renderSlide: getSwiperSlideHtml,
                     addSlidesBefore: 1,
                     addSlidesAfter: 1
@@ -389,6 +448,8 @@ export default function (options) {
             if (useFakeZoomImage) {
                 swiperInstance.on('zoomChange', onZoomChange);
             }
+
+            swiperInstance.on('zoomChange', onZoomChangeLoadFullImage);
 
             if (swiperInstance.autoplay?.running) onAutoplayStart();
         });
@@ -413,8 +474,13 @@ export default function (options) {
      * @returns {string} The HTML markup of the slide.
      */
     function getSwiperSlideHtmlFromItem(item) {
+        imageMaxSize = imageMaxSize || getSlideshowImageMaxSize();
+        const { displayImage, fullImage, originalImage } = getImgUrls(item, currentOptions.user, imageMaxSize);
+
         return getSwiperSlideHtmlFromSlide({
-            originalImage: getImgUrl(item, currentOptions.user),
+            displayImage,
+            fullImage,
+            originalImage,
             Id: item.Id,
             ServerId: item.ServerId
         });
@@ -426,13 +492,15 @@ export default function (options) {
      * @returns {string} The HTML markup of the slide.
      */
     function getSwiperSlideHtmlFromSlide(item) {
+        const displayImage = item.displayImage || item.originalImage;
+        const fullImage = item.fullImage && item.fullImage !== displayImage ? ' data-fullimage="' + item.fullImage + '"' : '';
         let html = '';
-        html += '<div class="swiper-slide" data-original="' + item.originalImage + '" data-itemid="' + item.Id + '" data-serverid="' + item.ServerId + '">';
+        html += '<div class="swiper-slide" data-original="' + item.originalImage + '"' + fullImage + ' data-itemid="' + item.Id + '" data-serverid="' + item.ServerId + '">';
         html += '<div class="swiper-zoom-container">';
         if (useFakeZoomImage) {
-            html += `<div class="swiper-zoom-fakeimg swiper-zoom-fakeimg-hidden" style="background-image: url('${item.originalImage}')"></div>`;
+            html += `<div class="swiper-zoom-fakeimg swiper-zoom-fakeimg-hidden" style="background-image: url('${displayImage}')"></div>`;
         }
-        html += '<img src="' + item.originalImage + '" class="swiper-slide-img">';
+        html += '<img src="' + displayImage + '" class="swiper-slide-img">';
         html += '</div>';
         if (item.title || item.subtitle) {
             html += '<div class="slideText">';
@@ -576,6 +644,10 @@ export default function (options) {
         inputManager.off(window, onInputCommand);
         /* eslint-disable-next-line compat/compat */
         document.removeEventListener((window.PointerEvent ? 'pointermove' : 'mousemove'), onPointerMove);
+
+        if (screenfull.isEnabled) {
+            screenfull.off('change', onFullscreenChange);
+        }
 
         currentOptions.onClose?.();
     }

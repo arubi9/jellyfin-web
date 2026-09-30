@@ -2,6 +2,42 @@ import browser from './browser';
 import appSettings from './settings/appSettings';
 import * as userSettings from './settings/userSettings';
 
+/**
+ * Shared media test elements (never attached to the document).
+ * @type {Map<string, HTMLMediaElement>}
+ */
+const testElements = new Map();
+
+/**
+ * Gets the shared test element for the tag. Its canPlayType results are cached,
+ * as they do not change during a session and are slow on some TVs.
+ * @param {'video' | 'audio'} tagName - The element tag name.
+ * @returns {HTMLMediaElement} The test element.
+ */
+function getTestElement(tagName) {
+    let elem = testElements.get(tagName);
+    if (!elem) {
+        elem = document.createElement(tagName);
+
+        if (typeof elem.canPlayType === 'function') {
+            const nativeCanPlayType = elem.canPlayType.bind(elem);
+            const results = new Map();
+            elem.canPlayType = function (type) {
+                let result = results.get(type);
+                if (result === undefined) {
+                    result = nativeCanPlayType(type);
+                    results.set(type, result);
+                }
+                return result;
+            };
+        }
+
+        testElements.set(tagName, elem);
+    }
+
+    return elem;
+}
+
 function canPlayH264(videoTestElement) {
     return !!(videoTestElement.canPlayType?.('video/mp4; codecs="avc1.42E01E, mp4a.40.2"').replace(/no/, ''));
 }
@@ -76,7 +112,7 @@ function canPlayNativeHls() {
         return true;
     }
 
-    const media = document.createElement('video');
+    const media = getTestElement('video');
     return !!(media.canPlayType('application/x-mpegURL').replace(/no/, '')
             || media.canPlayType('application/vnd.apple.mpegURL').replace(/no/, ''));
 }
@@ -201,7 +237,7 @@ function canPlayAudioFormat(format) {
         typeString = 'audio/' + format;
     }
 
-    return !!document.createElement('audio').canPlayType(typeString).replace(/no/, '');
+    return !!getTestElement('audio').canPlayType(typeString).replace(/no/, '');
 }
 
 function testCanPlayMkv(videoTestElement) {
@@ -507,13 +543,13 @@ export default function (options) {
 
     const bitrateSetting = getMaxBitrate();
 
-    const videoTestElement = document.createElement('video');
+    const videoTestElement = getTestElement('video');
 
     const physicalAudioChannels = getPhysicalAudioChannels(options, videoTestElement);
 
     const canPlayVp8 = videoTestElement.canPlayType('video/webm; codecs="vp8"').replace(/no/, '');
     const canPlayVp9 = videoTestElement.canPlayType('video/webm; codecs="vp9"').replace(/no/, '');
-    const safariSupportsOpus = browser.safari && browser.versionMajor >= 17 && !!document.createElement('audio').canPlayType('audio/x-caf; codecs="opus"').replace(/no/, '');
+    const safariSupportsOpus = browser.safari && browser.versionMajor >= 17 && !!getTestElement('audio').canPlayType('audio/x-caf; codecs="opus"').replace(/no/, '');
     const webmAudioCodecs = ['vorbis'];
 
     const canPlayMkv = testCanPlayMkv(videoTestElement);

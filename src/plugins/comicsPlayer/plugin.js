@@ -66,7 +66,14 @@ export class ComicsPlayer {
         const mediaSourceId = this.item.Id;
         userSettings.setComicsPlayerSettings(this.comicsPlayerSettings, mediaSourceId);
 
+        if (this.swiperInstance) {
+            // Keep the styles as the dialog is still fading out
+            this.swiperInstance.destroy(true, false);
+            this.swiperInstance = null;
+        }
+
         this.archiveSource?.release();
+        this.archiveSource = null;
 
         const elem = this.mediaElement;
         if (elem) {
@@ -267,15 +274,22 @@ export class ComicsPlayer {
         }
 
         const downloadUrl = getLibraryApi(api).getDownloadUrl({ itemId: item.Id });
-        this.archiveSource = new ArchiveSource(downloadUrl);
+        const archiveSource = new ArchiveSource(downloadUrl);
+        this.archiveSource = archiveSource;
 
         //eslint-disable-next-line import/no-unresolved
         import('swiper/css/bundle');
 
-        return this.archiveSource.load()
+        return archiveSource.load()
             // eslint-disable-next-line import/no-unresolved
             .then(() => import('swiper/bundle'))
             .then(({ Swiper }) => {
+                // The player was stopped while loading
+                if (this.archiveSource !== archiveSource) {
+                    archiveSource.release();
+                    return;
+                }
+
                 loading.hide();
 
                 this.pageCount = this.archiveSource.urls.length;
@@ -353,20 +367,35 @@ class ArchiveSource {
         this.url = url;
         this.files = [];
         this.urls = [];
+        this.released = false;
     }
 
     async load() {
         const res = await fetch(this.url);
-        if (!res.ok) {
+        if (!res.ok || this.released) {
             return;
         }
 
         const blob = await res.blob();
-        this.archive = await Archive.open(blob);
-        this.raw = await this.archive.getFilesArray();
-        await this.archive.extractFiles();
+        if (this.released) {
+            return;
+        }
 
-        let files = await this.archive.getFilesArray();
+        const archive = await Archive.open(blob);
+        this.archive = archive;
+        if (this.released) {
+            this.closeArchive();
+            return;
+        }
+
+        await archive.extractFiles();
+        let files = await archive.getFilesArray();
+
+        // Only the extracted pages are needed from now on, drop the archive (and the compressed blob it references)
+        this.closeArchive();
+        if (this.released) {
+            return;
+        }
 
         // metadata files and files without a file extension should not be considered as a page
         files = files.filter((file) => {
@@ -388,7 +417,18 @@ class ArchiveSource {
         }
     }
 
+    closeArchive() {
+        const archive = this.archive;
+        this.archive = null;
+        // Terminates the worker if it is still running
+        archive?.close().catch((err) => {
+            console.error('[ComicsPlayer] failed to close archive', err);
+        });
+    }
+
     release() {
+        this.released = true;
+        this.closeArchive();
         this.files = [];
         this.urls.forEach(URL.revokeObjectURL);
         this.urls = [];

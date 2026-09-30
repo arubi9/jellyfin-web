@@ -7,6 +7,7 @@ import { TICKS_PER_MINUTE, TICKS_PER_SECOND } from 'constants/time';
 import { EventType } from 'constants/eventType';
 
 import { playbackManager } from 'components/playback/playbackmanager';
+import { showEpisodesPanel } from 'components/playback/episodesPanel';
 import browser from 'scripts/browser';
 import dom from 'utils/dom';
 import inputManager from 'scripts/inputManager';
@@ -33,6 +34,11 @@ import { ServerConnections } from 'lib/jellyfin-apiclient';
 import LibraryMenu from 'scripts/libraryMenu';
 import { setBackdropTransparency, TRANSPARENCY_LEVEL } from 'components/backdrop/backdrop';
 import { pluginManager } from 'components/pluginManager';
+
+/** Minimum delay before refreshing the same (ended) live TV program again. */
+const PROGRAM_REFRESH_BACKOFF_MS = 30000;
+/** Upper bound of trickplay sheets preloaded per item. */
+const TRICKPLAY_MAX_PRELOAD_SHEETS = 50;
 
 function getOpenedDialog() {
     return document.querySelector('.dialogContainer .dialog.opened');
@@ -84,6 +90,11 @@ export default function (view) {
         });
     }
 
+    function getDisplayItemAndUpdate(item) {
+        displayItemRequest = getDisplayItem(item).then(updateDisplayItem);
+        return displayItemRequest;
+    }
+
     function updateDisplayItem(itemInfo) {
         const item = itemInfo.originalItem;
         currentItem = item;
@@ -120,8 +131,8 @@ export default function (view) {
         } else {
             startTimeText.classList.add('hide');
             endTimeText.classList.add('hide');
-            startTimeText.innerHTML = '';
-            endTimeText.innerHTML = '';
+            setHtml(startTimeText, '');
+            setHtml(endTimeText, '');
             programStartDateMs = 0;
             programEndDateMs = 0;
         }
@@ -139,6 +150,7 @@ export default function (view) {
 
         // Update trickplay data
         trickplayResolution = null;
+        trickplayItemId = item.Id;
 
         const mediaSourceId = currentPlayer.streamInfo.mediaSource.Id;
         const trickplayResolutions = item.Trickplay?.[mediaSourceId];
@@ -155,6 +167,10 @@ export default function (view) {
             }
 
             if (bestWidth) trickplayResolution = trickplayResolutions[bestWidth];
+        }
+
+        if (currentVisibleMenu === 'osd') {
+            preloadTrickplaySheets();
         }
     }
 
@@ -178,7 +194,18 @@ export default function (view) {
             html = getDisplayTimeWithoutAmPm(date);
         }
 
-        elem.innerHTML = html || '';
+        setHtml(elem, html || '');
+    }
+
+    /**
+     * Sets the element HTML only if it differs from the last HTML set by this function (avoids needless DOM writes).
+     * All writes to OSD time elements must go through here, otherwise the cached value goes stale.
+     */
+    function setHtml(elem, html) {
+        if (elem._osdHtml !== html) {
+            elem._osdHtml = html;
+            elem.innerHTML = html;
+        }
     }
 
     function shouldEnableProgressByTimeOfDay(item) {
@@ -199,13 +226,14 @@ export default function (view) {
             btnRewind.disabled = true;
             view.querySelector('.btnSubtitles').classList.add('hide');
             view.querySelector('.btnAudio').classList.add('hide');
+            view.querySelector('.btnEpisodes').classList.add('hide');
             view.querySelector('.osdTitle').innerHTML = '';
             view.querySelector('.osdMediaInfo').innerHTML = '';
             return;
         }
 
         enableProgressByTimeOfDay = shouldEnableProgressByTimeOfDay(item);
-        getDisplayItem(item).then(updateDisplayItem);
+        getDisplayItemAndUpdate(item);
         nowPlayingVolumeSlider.disabled = false;
         nowPlayingPositionSlider.disabled = false;
         btnFastForward.disabled = false;
@@ -218,6 +246,8 @@ export default function (view) {
             view.querySelector('.btnSubtitles').classList.add('hide');
             toggleSubtitleSync('forceToHide');
         }
+
+        view.querySelector('.btnEpisodes').classList.toggle('hide', item.Type !== 'Episode' || !item.SeriesId);
 
         if (playbackManager.audioTracks(player).length > 1) {
             view.querySelector('.btnAudio').classList.remove('hide');
@@ -268,15 +298,43 @@ export default function (view) {
     }
 
     let mouseIsDown = false;
+    /** Whether SHOW_VIDEO_OSD was last triggered with `true`. */
+    let isOsdShown = false;
+    /** The element focused by the last `_focus` call. */
+    let lastOsdFocusElement = null;
 
     function showOsd(focusElement) {
-        Events.trigger(document, EventType.SHOW_VIDEO_OSD, [ true ]);
+        // Fast path (mouse moves): the OSD is already shown and the focus is still where `_focus` put it
+        // (or focus isn't managed, on mobile), so there is nothing to do but to push back the hide timer.
+        // TV layouts always take the full path to keep their focus validation.
+        if (isOsdShown && currentVisibleMenu === 'osd' && !focusElement && !layoutManager.tv
+            && (layoutManager.mobile || (lastOsdFocusElement && document.activeElement === lastOsdFocusElement))) {
+            resetIdle();
+            return;
+        }
+
+        if (!isOsdShown) {
+            isOsdShown = true;
+            Events.trigger(document, EventType.SHOW_VIDEO_OSD, [ true ]);
+        }
         slideDownToShow(headerElement);
         showMainOsdControls(focusElement);
         resetIdle();
     }
 
+    /**
+     * Keeps the OSD from hiding while the user interacts with it (e.g. hovering the seek bar).
+     */
+    function keepOsdVisible() {
+        if (isOsdShown && currentVisibleMenu === 'osd') {
+            resetIdle();
+        } else {
+            showOsd();
+        }
+    }
+
     function hideOsd() {
+        isOsdShown = false;
         Events.trigger(document, EventType.SHOW_VIDEO_OSD, [ false ]);
         slideUpToHide(headerElement);
         hideMainOsdControls();
@@ -335,6 +393,8 @@ export default function (view) {
         }
 
         if (focusElement) focusManager.focus(focusElement);
+
+        lastOsdFocusElement = document.activeElement;
     };
 
     function showMainOsdControls(focusElement) {
@@ -349,6 +409,10 @@ export default function (view) {
                 _focus(focusElement);
             }
             toggleSubtitleSync();
+
+            // Time texts are not updated while the OSD is hidden
+            refreshTimeDisplay();
+            preloadTrickplaySheets();
         } else if (currentVisibleMenu === 'osd' && !layoutManager.mobile) {
             _focus(focusElement);
         }
@@ -705,12 +769,38 @@ export default function (view) {
                 try {
                     const endDate = datetime.parseISO8601Date(program.EndDate);
 
-                    if (new Date().getTime() >= endDate.getTime()) {
+                    const now = new Date().getTime();
+
+                    if (now >= endDate.getTime()) {
+                        // Refresh once per ended program, retry (e.g. EPG lag or clock skew) only after a backoff,
+                        // and never while a refresh is still in flight
+                        const programKey = `${item.Id}|${program.Id}|${program.EndDate}`;
+                        if (programRefreshInFlight
+                            || (programKey === lastProgramRefreshKey && now - lastProgramRefreshTime < PROGRAM_REFRESH_BACKOFF_MS)) {
+                            return;
+                        }
+
                         console.debug('program info needs to be refreshed');
+                        lastProgramRefreshKey = programKey;
+                        lastProgramRefreshTime = now;
+                        programRefreshInFlight = true;
+                        displayItemRequest = null;
+
                         const state = playbackManager.getPlayerState(player);
-                        onStateChanged.call(player, {
-                            type: 'init'
-                        }, state);
+                        try {
+                            onStateChanged.call(player, {
+                                type: 'init'
+                            }, state);
+                        } finally {
+                            const clearInFlight = () => {
+                                programRefreshInFlight = false;
+                            };
+                            if (displayItemRequest) {
+                                displayItemRequest.then(clearInFlight, clearInFlight);
+                            } else {
+                                clearInFlight();
+                            }
+                        }
                     }
                 } catch (e) {
                     console.error('error parsing date: ' + program.EndDate, e);
@@ -792,46 +882,63 @@ export default function (view) {
     }
 
     function updateTimeDisplay(positionTicks, runtimeTicks, playbackStartTimeTicks, playbackRate, bufferedRanges) {
-        if (enableProgressByTimeOfDay) {
-            if (nowPlayingPositionSlider && !nowPlayingPositionSlider.dragging) {
+        lastTimeDisplayArgs = [positionTicks, runtimeTicks, playbackStartTimeTicks, playbackRate, bufferedRanges];
+
+        if (nowPlayingPositionSlider && !nowPlayingPositionSlider.dragging) {
+            if (enableProgressByTimeOfDay) {
                 if (programStartDateMs && programEndDateMs) {
                     const currentTimeMs = (playbackStartTimeTicks + (positionTicks || 0)) / 1e4;
                     const programRuntimeMs = programEndDateMs - programStartDateMs;
 
                     nowPlayingPositionSlider.value = getDisplayPercentByTimeOfDay(programStartDateMs, programRuntimeMs, currentTimeMs);
-
-                    if (bufferedRanges.length) {
-                        const rangeStart = getDisplayPercentByTimeOfDay(programStartDateMs, programRuntimeMs, (playbackStartTimeTicks + (bufferedRanges[0].start || 0)) / 1e4);
-                        const rangeEnd = getDisplayPercentByTimeOfDay(programStartDateMs, programRuntimeMs, (playbackStartTimeTicks + (bufferedRanges[0].end || 0)) / 1e4);
-                        nowPlayingPositionSlider.setBufferedRanges([{
-                            start: rangeStart,
-                            end: rangeEnd
-                        }]);
-                    } else {
-                        nowPlayingPositionSlider.setBufferedRanges([]);
-                    }
                 } else {
                     nowPlayingPositionSlider.value = 0;
+                }
+            } else if (runtimeTicks) {
+                let pct = positionTicks / runtimeTicks;
+                pct *= 100;
+                nowPlayingPositionSlider.value = pct;
+            } else {
+                nowPlayingPositionSlider.value = 0;
+            }
+        }
+
+        // Texts and buffered ranges are not visible while the OSD is hidden - they are refreshed when it is shown
+        if (currentVisibleMenu === 'osd') {
+            updateTimeTexts(positionTicks, runtimeTicks, playbackStartTimeTicks, playbackRate, bufferedRanges);
+        }
+    }
+
+    function refreshTimeDisplay() {
+        if (lastTimeDisplayArgs && currentItem) {
+            updateTimeTexts(...lastTimeDisplayArgs);
+        }
+    }
+
+    function updateTimeTexts(positionTicks, runtimeTicks, playbackStartTimeTicks, playbackRate, bufferedRanges) {
+        if (enableProgressByTimeOfDay) {
+            if (nowPlayingPositionSlider && !nowPlayingPositionSlider.dragging) {
+                if (programStartDateMs && programEndDateMs && bufferedRanges.length) {
+                    const programRuntimeMs = programEndDateMs - programStartDateMs;
+                    const rangeStart = getDisplayPercentByTimeOfDay(programStartDateMs, programRuntimeMs, (playbackStartTimeTicks + (bufferedRanges[0].start || 0)) / 1e4);
+                    const rangeEnd = getDisplayPercentByTimeOfDay(programStartDateMs, programRuntimeMs, (playbackStartTimeTicks + (bufferedRanges[0].end || 0)) / 1e4);
+                    nowPlayingPositionSlider.setBufferedRanges([{
+                        start: rangeStart,
+                        end: rangeEnd
+                    }]);
+                } else {
                     nowPlayingPositionSlider.setBufferedRanges([]);
                 }
             }
 
-            nowPlayingPositionText.innerHTML = '';
-            nowPlayingDurationText.innerHTML = '';
+            setHtml(nowPlayingPositionText, '');
+            setHtml(nowPlayingDurationText, '');
         } else {
             if (nowPlayingPositionSlider && !nowPlayingPositionSlider.dragging) {
-                if (runtimeTicks) {
-                    let pct = positionTicks / runtimeTicks;
-                    pct *= 100;
-                    nowPlayingPositionSlider.value = pct;
-                } else {
-                    nowPlayingPositionSlider.value = 0;
-                }
-
                 if (runtimeTicks && positionTicks != null && currentRuntimeTicks && !enableProgressByTimeOfDay && currentItem.RunTimeTicks && currentItem.Type !== 'Recording' && playbackRate !== null) {
-                    endsAtText.innerHTML = '&nbsp;&nbsp;&nbsp;&nbsp;' + mediaInfo.getEndsAtFromPosition(runtimeTicks, positionTicks, playbackRate, true);
+                    setHtml(endsAtText, '&nbsp;&nbsp;&nbsp;&nbsp;' + mediaInfo.getEndsAtFromPosition(runtimeTicks, positionTicks, playbackRate, true));
                 } else {
-                    endsAtText.innerHTML = '';
+                    setHtml(endsAtText, '');
                 }
             }
 
@@ -849,8 +956,7 @@ export default function (view) {
             if (userSettings.enableVideoRemainingTime()) {
                 const leftTicks = runtimeTicks - positionTicks;
                 if (leftTicks >= 0) {
-                    updateTimeText(nowPlayingDurationText, leftTicks);
-                    nowPlayingDurationText.innerHTML = '-' + nowPlayingDurationText.innerHTML;
+                    setHtml(nowPlayingDurationText, '-' + datetime.getDisplayRunningTime(leftTicks));
                     nowPlayingDurationText.classList.remove('hide');
                 } else {
                     nowPlayingPositionText.classList.add('hide');
@@ -931,7 +1037,7 @@ export default function (view) {
 
     function updateTimeText(elem, ticks, divider) {
         if (ticks == null) {
-            elem.innerHTML = '';
+            setHtml(elem, '');
             return;
         }
 
@@ -941,7 +1047,7 @@ export default function (view) {
             html = '&nbsp;/&nbsp;' + html;
         }
 
-        elem.innerHTML = html;
+        setHtml(elem, html);
     }
 
     function nowPlayingDurationTextClick() {
@@ -1219,8 +1325,8 @@ export default function (view) {
 
         const isKeyModified = e.ctrlKey || e.altKey || e.metaKey;
 
-        // Skip modified keys
-        if (isKeyModified) return;
+        // Skip modified keys, and leave keys to an open dialog (episodes, subtitles, ...)
+        if (isKeyModified || getOpenedDialog()) return;
 
         const key = keyboardnavigation.getKeyName(e);
 
@@ -1428,12 +1534,33 @@ export default function (view) {
 
     function onWheel(e) {
         if (getOpenedDialog()) return;
-        if (e.deltaY < 0) {
+
+        // Trackpads fire dozens of wheel events per second: accumulate them and change the volume once per frame
+        wheelDeltaY += e.deltaY;
+        if (!wheelFrame) {
+            wheelFrame = requestAnimationFrame(applyWheelVolume);
+        }
+    }
+
+    function applyWheelVolume() {
+        wheelFrame = null;
+        const deltaY = wheelDeltaY;
+        wheelDeltaY = 0;
+
+        if (deltaY < 0) {
             playbackManager.volumeUp(currentPlayer);
         }
-        if (e.deltaY > 0) {
+        if (deltaY > 0) {
             playbackManager.volumeDown(currentPlayer);
         }
+    }
+
+    function cancelWheelVolume() {
+        if (wheelFrame) {
+            cancelAnimationFrame(wheelFrame);
+            wheelFrame = null;
+        }
+        wheelDeltaY = 0;
     }
 
     function onWindowMouseDown(e) {
@@ -1453,22 +1580,154 @@ export default function (view) {
         resetIdle();
     }
 
-    function updateTrickplayBubbleHtml(apiClient, trickplayInfo, item, mediaSourceId, bubble, positionTicks) {
-        let doFullUpdate = false;
-        let chapterThumbContainer = bubble.querySelector('.chapterThumbContainer');
-        let chapterThumb;
+    /**
+     * Returns the trickplay sheet cache for the current item, creating it when the item, media source or resolution changed.
+     * Sheet URLs are built once and each sheet is loaded at most once.
+     */
+    function getTrickplayCache() {
+        const item = currentItem;
+        const trickplayInfo = trickplayResolution;
+        const mediaSourceId = currentPlayer?.streamInfo?.mediaSource?.Id;
+
+        // trickplayResolution is updated asynchronously after currentItem, make sure they belong together
+        if (!item?.Trickplay || !trickplayInfo || !mediaSourceId || trickplayItemId !== item.Id) {
+            return null;
+        }
+
+        const key = `${item.Id}|${mediaSourceId}|${trickplayInfo.Width}`;
+
+        if (trickplayCache?.key !== key) {
+            const tilesPerSheet = trickplayInfo.TileWidth * trickplayInfo.TileHeight;
+            const sheetCount = tilesPerSheet > 0 && trickplayInfo.ThumbnailCount > 0 ?
+                Math.ceil(trickplayInfo.ThumbnailCount / tilesPerSheet) : 0;
+
+            trickplayCache = {
+                key,
+                apiClient: ServerConnections.getApiClient(item.ServerId),
+                itemId: item.Id,
+                mediaSourceId,
+                width: trickplayInfo.Width,
+                sheetCount: Math.min(sheetCount, TRICKPLAY_MAX_PRELOAD_SHEETS),
+                sheets: new Map(),
+                preloadIndex: -1
+            };
+        }
+
+        return trickplayCache;
+    }
+
+    function getTrickplaySheet(cache, index) {
+        let sheet = cache.sheets.get(index);
+
+        if (!sheet) {
+            sheet = {
+                url: cache.apiClient.getUrl('Videos/' + cache.itemId + '/Trickplay/' + cache.width + '/' + index + '.jpg', {
+                    ApiKey: cache.apiClient.accessToken(),
+                    MediaSourceId: cache.mediaSourceId
+                }),
+                loaded: false,
+                image: null,
+                callbacks: []
+            };
+            cache.sheets.set(index, sheet);
+        }
+
+        return sheet;
+    }
+
+    /**
+     * Loads a sheet, unless it is already loaded or loading. Calls `callback` when the sheet has finished loading (or failed).
+     * A failed sheet is requested again by the next call (e.g. the next hover), like before.
+     */
+    function loadTrickplaySheet(cache, index, callback) {
+        const sheet = getTrickplaySheet(cache, index);
+
+        if (sheet.loaded) {
+            callback?.();
+            return sheet;
+        }
+
+        if (callback) sheet.callbacks.push(callback);
+
+        if (!sheet.image) {
+            const image = new Image();
+            const onDone = (loaded) => {
+                sheet.loaded = loaded;
+                // Allow a retry after an error
+                sheet.image = loaded ? image : null;
+                const callbacks = sheet.callbacks;
+                sheet.callbacks = [];
+                for (const fn of callbacks) fn();
+                if (loaded && trickplayCache === cache) {
+                    applyPendingTrickplay(cache, index);
+                }
+            };
+            image.onload = () => onDone(true);
+            image.onerror = () => onDone(false);
+            sheet.image = image;
+            image.src = sheet.url;
+        }
+
+        return sheet;
+    }
+
+    /**
+     * Preloads the trickplay sheets of the current item one after another, to not compete too much with the video stream.
+     */
+    function preloadTrickplaySheets() {
+        const cache = getTrickplayCache();
+
+        if (!cache || cache.preloadIndex >= 0) {
+            return;
+        }
+
+        const preloadNext = () => {
+            // Stop when the item has changed
+            if (trickplayCache !== cache) return;
+
+            cache.preloadIndex++;
+            if (cache.preloadIndex < cache.sheetCount) {
+                loadTrickplaySheet(cache, cache.preloadIndex, preloadNext);
+            }
+        };
+
+        preloadNext();
+    }
+
+    function setTrickplayThumb(chapterThumb, sheet, offsetX, offsetY) {
+        const backgroundImage = `url('${sheet.url}')`;
+        if (chapterThumb._trickplayBackground !== backgroundImage) {
+            chapterThumb._trickplayBackground = backgroundImage;
+            chapterThumb.style.backgroundImage = backgroundImage;
+        }
+        chapterThumb.style.backgroundPositionX = offsetX + 'px';
+        chapterThumb.style.backgroundPositionY = offsetY + 'px';
+    }
+
+    function applyPendingTrickplay(cache, index) {
+        const pending = pendingTrickplay;
+
+        if (pending?.cache === cache && pending.index === index) {
+            pendingTrickplay = null;
+
+            if (pending.chapterThumb.isConnected) {
+                setTrickplayThumb(pending.chapterThumb, getTrickplaySheet(cache, index), pending.offsetX, pending.offsetY);
+            }
+        }
+    }
+
+    function updateTrickplayBubbleHtml(cache, trickplayInfo, item, bubble, positionTicks) {
+        let chapterThumb = bubble.querySelector('.chapterThumbWrapper');
         let chapterThumbText;
         let chapterThumbName;
 
         // Create bubble elements if they don't already exist
-        if (chapterThumbContainer) {
-            chapterThumb = chapterThumbContainer.querySelector('.chapterThumbWrapper');
+        if (chapterThumb) {
+            const chapterThumbContainer = chapterThumb.parentNode;
             chapterThumbText = chapterThumbContainer.querySelector('h2.chapterThumbText');
             chapterThumbName = chapterThumbContainer.querySelector('div.chapterThumbText');
         } else {
-            doFullUpdate = true;
-
-            chapterThumbContainer = document.createElement('div');
+            const chapterThumbContainer = document.createElement('div');
             chapterThumbContainer.classList.add('chapterThumbContainer');
             chapterThumbContainer.style.overflow = 'hidden';
 
@@ -1490,6 +1749,10 @@ export default function (view) {
             chapterThumbText = document.createElement('h2');
             chapterThumbText.classList.add('chapterThumbText');
             chapterThumbTextContainer.appendChild(chapterThumbText);
+
+            // Keep the live elements, so a sheet that finishes loading later can still be applied to them
+            bubble.innerHTML = '';
+            bubble.appendChild(chapterThumbContainer);
         }
 
         let chapter;
@@ -1514,22 +1777,19 @@ export default function (view) {
         const offsetX = -(tileOffsetX * trickplayInfo.Width);
         const offsetY = -(tileOffsetY * trickplayInfo.Height);
 
-        const imgSrc = apiClient.getUrl('Videos/' + item.Id + '/Trickplay/' + trickplayInfo.Width + '/' + index + '.jpg', {
-            ApiKey: apiClient.accessToken(),
-            MediaSourceId: mediaSourceId
-        });
+        const sheet = getTrickplaySheet(cache, index);
 
-        chapterThumb.style.backgroundImage = `url('${imgSrc}')`;
-        chapterThumb.style.backgroundPositionX = offsetX + 'px';
-        chapterThumb.style.backgroundPositionY = offsetY + 'px';
+        if (sheet.loaded) {
+            pendingTrickplay = null;
+            setTrickplayThumb(chapterThumb, sheet, offsetX, offsetY);
+        } else {
+            // Keep showing the previous thumbnail until the sheet has loaded, instead of a wrong tile or nothing
+            pendingTrickplay = { cache, index, chapterThumb, offsetX, offsetY };
+            loadTrickplaySheet(cache, index);
+        }
 
         chapterThumbText.textContent = datetime.getDisplayRunningTime(positionTicks);
         chapterThumbName.textContent = chapter?.Name || '';
-
-        // Set bubble innerHTML if container isn't part of DOM
-        if (doFullUpdate) {
-            bubble.innerHTML = chapterThumbContainer.outerHTML;
-        }
 
         return true;
     }
@@ -1549,23 +1809,7 @@ export default function (view) {
         return null;
     }
 
-    function getChapterBubbleHtml(apiClient, item, chapters, positionTicks) {
-        let chapter;
-        let index = -1;
-
-        for (let i = 0, length = chapters.length; i < length; i++) {
-            const currentChapter = chapters[i];
-
-            if (positionTicks >= currentChapter.StartPositionTicks) {
-                chapter = currentChapter;
-                index = i;
-            }
-        }
-
-        if (!chapter) {
-            return null;
-        }
-
+    function getChapterBubbleHtml(apiClient, item, chapter, index, positionTicks) {
         const src = getImgUrl(item, chapter, index, 400, apiClient);
         let html = '<div class="chapterThumbContainer chapterBubblePosition">';
 
@@ -1585,6 +1829,50 @@ export default function (view) {
         html += '</div>';
 
         return html + '</div>';
+    }
+
+    /**
+     * Updates the chapter bubble. The HTML (and thumbnail image) is only rebuilt when the chapter changes,
+     * otherwise only the time text is updated.
+     *
+     * @returns {boolean} false if there is no chapter at this position
+     */
+    function updateChapterBubbleHtml(apiClient, item, chapters, bubble, positionTicks) {
+        let chapter;
+        let index = -1;
+
+        for (let i = 0, length = chapters.length; i < length; i++) {
+            const currentChapter = chapters[i];
+
+            if (positionTicks >= currentChapter.StartPositionTicks) {
+                chapter = currentChapter;
+                index = i;
+            }
+        }
+
+        if (!chapter) {
+            return false;
+        }
+
+        const cached = chapterBubbleCache;
+
+        if (cached?.chapter === chapter && cached.index === index && cached.container.isConnected
+            && bubble.firstElementChild === cached.container) {
+            cached.timeElement.textContent = datetime.getDisplayRunningTime(positionTicks);
+            return true;
+        }
+
+        bubble.innerHTML = getChapterBubbleHtml(apiClient, item, chapter, index, positionTicks);
+
+        const container = bubble.firstElementChild;
+        chapterBubbleCache = {
+            chapter,
+            index,
+            container,
+            timeElement: container.querySelector('h2.chapterThumbText')
+        };
+
+        return true;
     }
 
     let playPauseClickTimeout;
@@ -1638,6 +1926,19 @@ export default function (view) {
     let playbackStartTimeTicks = 0;
     let subtitleSyncOverlay;
     let trickplayResolution = null;
+    /** Id of the item `trickplayResolution` belongs to. */
+    let trickplayItemId = null;
+    let trickplayCache = null;
+    let pendingTrickplay = null;
+    let chapterBubbleCache = null;
+    let markerInfoCache = null;
+    let lastTimeDisplayArgs = null;
+    let displayItemRequest = null;
+    let programRefreshInFlight = false;
+    let lastProgramRefreshKey = null;
+    let lastProgramRefreshTime = 0;
+    let wheelDeltaY = 0;
+    let wheelFrame = null;
     const nowPlayingVolumeSlider = view.querySelector('.osdVolumeSlider');
     const nowPlayingVolumeSliderContainer = view.querySelector('.osdVolumeSliderContainer');
     const nowPlayingPositionSlider = view.querySelector('.osdPositionSlider');
@@ -1752,6 +2053,10 @@ export default function (view) {
             dom.removeEventListener(document, 'click', onClickCapture, { capture: true });
         }
         stopOsdHideTimer();
+        cancelWheelVolume();
+        pendingTrickplay = null;
+        // Force the full showOsd path (and SHOW_VIDEO_OSD) when this view is shown again
+        isOsdShown = false;
         headerElement.classList.remove('osdHeader');
         headerElement.classList.remove('osdHeader-hidden');
         /* eslint-disable-next-line compat/compat */
@@ -1874,26 +2179,32 @@ export default function (view) {
     });
 
     nowPlayingPositionSlider.updateBubbleHtml = function(bubble, value) {
-        showOsd();
+        // Only keep the OSD alive, calling showOsd on every bubble frame is too expensive
+        keepOsdVisible();
 
         const item = currentItem;
         const ticks = currentRuntimeTicks * value / 100;
 
         if (trickplayResolution && item?.Trickplay) {
-            return updateTrickplayBubbleHtml(
-                ServerConnections.getApiClient(item.ServerId),
-                trickplayResolution,
-                item,
-                currentPlayer.streamInfo.mediaSource.Id,
-                bubble,
-                ticks);
+            const cache = getTrickplayCache();
+            if (cache) {
+                return updateTrickplayBubbleHtml(
+                    cache,
+                    trickplayResolution,
+                    item,
+                    bubble,
+                    ticks);
+            }
+        }
+
+        if (!enableProgressByTimeOfDay && currentRuntimeTicks && item?.Chapters?.length) {
+            return updateChapterBubbleHtml(ServerConnections.getApiClient(item.ServerId), item, item.Chapters, bubble, ticks);
         }
 
         return false;
     };
 
     nowPlayingPositionSlider.getBubbleHtml = function (value) {
-        showOsd();
         if (enableProgressByTimeOfDay) {
             if (programStartDateMs && programEndDateMs) {
                 let ms = programEndDateMs - programStartDateMs;
@@ -1913,25 +2224,31 @@ export default function (view) {
         let ticks = currentRuntimeTicks;
         ticks /= 100;
         ticks *= value;
-        const item = currentItem;
 
-        if (item?.Chapters?.length) {
-            const html = getChapterBubbleHtml(ServerConnections.getApiClient(item.ServerId), item, item.Chapters, ticks);
-
-            if (html) {
-                return html;
-            }
-        }
-
+        // Chapters are handled by updateBubbleHtml
         return '<h1 class="sliderBubbleText">' + datetime.getDisplayRunningTime(ticks) + '</h1>';
     };
 
     nowPlayingPositionSlider.getMarkerInfo = function () {
-        // use markers based on chapters
-        return currentItem?.Chapters?.map(currentChapter => ({
-            name: currentChapter.Name,
-            progress: currentChapter.StartPositionTicks / currentItem.RunTimeTicks
-        })) || [];
+        const item = currentItem;
+        const chapters = item?.Chapters;
+        const runTimeTicks = item?.RunTimeTicks;
+
+        // Called on every progress update: only rebuild the array when the chapters change,
+        // so the slider can skip its deep comparison
+        if (markerInfoCache?.chapters !== chapters || markerInfoCache.runTimeTicks !== runTimeTicks) {
+            // use markers based on chapters
+            markerInfoCache = {
+                chapters,
+                runTimeTicks,
+                markerInfo: chapters?.map(currentChapter => ({
+                    name: currentChapter.Name,
+                    progress: currentChapter.StartPositionTicks / runTimeTicks
+                })) || []
+            };
+        }
+
+        return markerInfoCache.markerInfo;
     };
 
     view.querySelector('.btnPreviousTrack').addEventListener('click', function () {
@@ -1957,6 +2274,16 @@ export default function (view) {
     });
     view.querySelector('.btnAudio').addEventListener('click', showAudioTrackSelection);
     view.querySelector('.btnSubtitles').addEventListener('click', showSubtitleTrackSelection);
+    view.querySelector('.btnEpisodes').addEventListener('click', () => {
+        showEpisodesPanel(currentItem, currentPlayer)
+            .catch(err => console.error('[VideoOSD] failed to show episodes', err))
+            .finally(() => {
+                resetIdle();
+            });
+
+        // Keep the OSD visible while the panel is open (like the other menus)
+        setTimeout(resetIdle, 0);
+    });
 
     // HACK: Remove `emby-button` from the rating button to make it look like the other buttons
     view.querySelector('.btnUserRating').classList.remove('emby-button');
@@ -2033,37 +2360,48 @@ export default function (view) {
         }, iconVisibilityTime);
     };
 
+    const onSyncPlayEnabled = (_event, enabled) => {
+        if (!enabled) {
+            const syncPlayIcon = view.querySelector('#syncPlayIcon');
+            syncPlayIcon.style.visibility = 'hidden';
+        }
+    };
+
+    const onSyncPlayNotifyOsd = (_event, action) => {
+        showIcon(action);
+    };
+
+    const onSyncPlayGroupStateUpdate = (_event, state, reason) => {
+        if (state === 'Playing' && reason === 'Unpause') {
+            showIcon('schedule-play');
+        } else if (state === 'Playing' && reason === 'Ready') {
+            showIcon('schedule-play');
+        } else if (state === 'Paused' && reason === 'Pause') {
+            showIcon('pause');
+        } else if (state === 'Paused' && reason === 'Ready') {
+            showIcon('clear');
+        } else if (state === 'Waiting' && reason === 'Seek') {
+            showIcon('seek');
+        } else if (state === 'Waiting' && reason === 'Buffer') {
+            showIcon('buffering');
+        } else if (state === 'Waiting' && reason === 'Pause') {
+            showIcon('wait-pause');
+        } else if (state === 'Waiting' && reason === 'Unpause') {
+            showIcon('wait-unpause');
+        }
+    };
+
     const SyncPlay = pluginManager.firstOfType(PluginType.SyncPlay)?.instance;
     if (SyncPlay) {
-        Events.on(SyncPlay.Manager, 'enabled', (_event, enabled) => {
-            if (!enabled) {
-                const syncPlayIcon = view.querySelector('#syncPlayIcon');
-                syncPlayIcon.style.visibility = 'hidden';
-            }
-        });
+        Events.on(SyncPlay.Manager, 'enabled', onSyncPlayEnabled);
+        Events.on(SyncPlay.Manager, 'notify-osd', onSyncPlayNotifyOsd);
+        Events.on(SyncPlay.Manager, 'group-state-update', onSyncPlayGroupStateUpdate);
 
-        Events.on(SyncPlay.Manager, 'notify-osd', (_event, action) => {
-            showIcon(action);
-        });
-
-        Events.on(SyncPlay.Manager, 'group-state-update', (_event, state, reason) => {
-            if (state === 'Playing' && reason === 'Unpause') {
-                showIcon('schedule-play');
-            } else if (state === 'Playing' && reason === 'Ready') {
-                showIcon('schedule-play');
-            } else if (state === 'Paused' && reason === 'Pause') {
-                showIcon('pause');
-            } else if (state === 'Paused' && reason === 'Ready') {
-                showIcon('clear');
-            } else if (state === 'Waiting' && reason === 'Seek') {
-                showIcon('seek');
-            } else if (state === 'Waiting' && reason === 'Buffer') {
-                showIcon('buffering');
-            } else if (state === 'Waiting' && reason === 'Pause') {
-                showIcon('wait-pause');
-            } else if (state === 'Waiting' && reason === 'Unpause') {
-                showIcon('wait-unpause');
-            }
+        // The controller is recreated for every new view: unbind, or old (detached) controllers keep reacting
+        view.addEventListener('viewdestroy', function () {
+            Events.off(SyncPlay.Manager, 'enabled', onSyncPlayEnabled);
+            Events.off(SyncPlay.Manager, 'notify-osd', onSyncPlayNotifyOsd);
+            Events.off(SyncPlay.Manager, 'group-state-update', onSyncPlayGroupStateUpdate);
         });
     }
 }

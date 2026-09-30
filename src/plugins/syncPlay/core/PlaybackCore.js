@@ -304,8 +304,11 @@ class PlaybackCore {
         } else {
             // Group playback already started.
             const serverPositionTicks = this.estimateCurrentTicks(positionTicks, playAtTime);
-            Helper.waitForEventOnce(this.manager, 'unpause').then(() => {
+            Helper.waitForEventOnce(this.manager, 'unpause', Helper.WaitForEventDefaultTimeout).then(() => {
                 this.localSeek(serverPositionTicks);
+            }).catch(() => {
+                // Don't seek later to an outdated position, sync correction will take care of it.
+                console.debug('SyncPlay scheduleUnpause: timed out while waiting for unpause event.');
             });
             this.localUnpause();
             setTimeout(() => {

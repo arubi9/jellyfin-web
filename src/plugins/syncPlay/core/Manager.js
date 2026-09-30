@@ -23,6 +23,7 @@ class Manager {
     constructor(playerFactory) {
         this.playerFactory = playerFactory;
         this.apiClient = null;
+        this.initialized = false;
 
         this.timeSyncCore = new TimeSyncCore();
         this.playbackCore = new PlaybackCore();
@@ -47,6 +48,21 @@ class Manager {
      * @param {Object} apiClient The ApiClient.
      */
     init(apiClient) {
+        if (this.initialized) {
+            // Components and listeners are bound once, only switch to the new ApiClient.
+            if (apiClient !== this.apiClient) {
+                this.updateApiClient(apiClient);
+                // Time measurements are specific to a server.
+                this.timeSyncCore.resetMeasurements();
+                if (this.isSyncPlayEnabled()) {
+                    this.timeSyncCore.forceUpdate();
+                }
+            }
+            return;
+        }
+
+        this.initialized = true;
+
         // Set ApiClient.
         this.updateApiClient(apiClient);
 
@@ -409,6 +425,8 @@ class Manager {
         this.lastPlaybackCommand = null;
         this.queuedCommand = null;
         this.playbackCore.syncEnabled = false;
+        // Time sync with the server is only needed while in a group, it is restarted by enableSyncPlay.
+        this.timeSyncCore.stopUpdates();
         Events.trigger(this, 'enabled', [false]);
         this.playerWrapper.unbindFromPlayer();
 

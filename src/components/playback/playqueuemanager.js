@@ -39,7 +39,10 @@ class PlayQueueManager {
 
         this._currentPlaylistItemId = null;
         this._playlist = items;
+        // Drop the previous queue's unshuffled copy so un-shuffling can't restore stale items
+        this._sortedPlaylist = [];
         this._repeatMode = 'RepeatNone';
+        this._shuffleMode = 'Sorted';
     }
 
     queue(items) {
@@ -134,14 +137,15 @@ class PlayQueueManager {
         }
 
         const currentPlaylistItemId = this.getCurrentPlaylistItemId();
-        const isCurrentIndex = playlistItemIds.indexOf(currentPlaylistItemId) !== -1;
+        const removedIds = new Set(playlistItemIds);
+        const isCurrentIndex = removedIds.has(currentPlaylistItemId);
 
         this._sortedPlaylist = this._sortedPlaylist.filter(function (item) {
-            return !playlistItemIds.includes(item.PlaylistItemId);
+            return !removedIds.has(item.PlaylistItemId);
         });
 
         this._playlist = this._playlist.filter(function (item) {
-            return !playlistItemIds.includes(item.PlaylistItemId);
+            return !removedIds.has(item.PlaylistItemId);
         });
 
         return {

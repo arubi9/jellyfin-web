@@ -1,6 +1,7 @@
 import { QueryCache, QueryClient } from '@tanstack/react-query';
 import type { PersistedClient, Persister } from '@tanstack/react-query-persist-client';
 import { get, set, del } from 'idb-keyval';
+import throttle from 'lodash-es/throttle';
 
 // TODO: Move this file to lib/query
 
@@ -12,6 +13,8 @@ const MAX_GC_TIME = 24 * 60 * 60 * 1000;
 const MAX_STALENESS = 60 * 1000;
 /** Maximum number of retries for failed queries. */
 const MAX_RETRIES = 2;
+/** Minimum time between cache writes. Every query event re-serializes the whole cache, so this must be throttled. */
+const PERSIST_THROTTLE_TIME = 1000;
 
 // NOTE: queryClient needs to be defined before the QueryCache so that it can be used in the onError callback.
 // eslint-disable-next-line prefer-const
@@ -62,9 +65,11 @@ queryClient = new QueryClient({
 
 /** Create an IndexedDB persister for react-query-persist-client. Uses idb-keyval for simplicity. */
 const createIDBPersister = (idbValidKey: IDBValidKey = 'query-cache') => ({
-    persistClient: async (client: PersistedClient) => {
-        await set(idbValidKey, client);
-    },
+    persistClient: throttle((client: PersistedClient) => {
+        set(idbValidKey, client).catch(err => {
+            console.warn('[QueryCache] failed to persist cache', err);
+        });
+    }, PERSIST_THROTTLE_TIME),
     restoreClient: () => {
         return get<PersistedClient>(idbValidKey);
     },

@@ -173,7 +173,9 @@ function updateNowPlayingInfo(context, state, serverId) {
             positionTo: contextButton
         };
         const apiClient = ServerConnections.getApiClient(item.ServerId);
-        apiClient.getItem(apiClient.getCurrentUserId(), item.Id).then(function (fullItem) {
+        // Fetch the item once for both the context menu and the user data buttons
+        const fullItemPromise = apiClient.getItem(apiClient.getCurrentUserId(), item.Id);
+        fullItemPromise.then(function (fullItem) {
             apiClient.getCurrentUser().then(function (user) {
                 contextButton.addEventListener('click', function () {
                     itemContextMenu.show(Object.assign({
@@ -187,7 +189,7 @@ function updateNowPlayingInfo(context, state, serverId) {
         });
         setImageUrl(context, state, url);
         setBackdrops([item]);
-        apiClient.getItem(apiClient.getCurrentUserId(), item.Id).then(function (fullItem) {
+        fullItemPromise.then(function (fullItem) {
             const userData = fullItem.UserData || {};
             const likes = userData.Likes == null ? '' : userData.Likes;
             context.querySelector('.nowPlayingPageUserDataButtonsTitle').innerHTML = '<button is="emby-ratingbutton" type="button" class="paper-icon-button-light" data-id="' + fullItem.Id + '" data-serverid="' + fullItem.ServerId + '" data-itemtype="' + fullItem.Type + '" data-likes="' + likes + '" data-isfavorite="' + userData.IsFavorite + '"><span class="material-icons favorite" aria-hidden="true"></span></button>';
@@ -447,11 +449,53 @@ export default function () {
         return playbackManager.getPlaylist(player);
     }
 
+    /**
+     * Moves the current item indicator of the rendered queue to the currently playing item.
+     * @param {HTMLElement} itemsContainer - Element containing the rendered queue.
+     * @param {Object} player - The player.
+     */
+    function updatePlaylistIndicator(itemsContainer, player) {
+        const playlistItemId = playbackManager.getCurrentPlaylistItemId(player);
+
+        for (const img of itemsContainer.querySelectorAll('.playlistIndexIndicatorImage')) {
+            if (playlistItemId && img.closest(`.listItem[data-playlistItemId="${playlistItemId}"]`)) {
+                continue;
+            }
+
+            img.classList.remove('playlistIndexIndicatorImage', 'playlistIndexIndicatorPausedImage');
+            // The image of the current item is never lazy loaded, load it now
+            if (img.getAttribute('data-src')) {
+                imageLoader.lazyImage(img);
+            }
+        }
+
+        if (playlistItemId) {
+            const img = itemsContainer.querySelector(`.listItem[data-playlistItemId="${playlistItemId}"] .listItemImage`);
+
+            if (img) {
+                img.classList.remove('lazy');
+                img.classList.add('playlistIndexIndicatorImage');
+                img.classList.toggle('playlistIndexIndicatorPausedImage', playbackManager.paused());
+            }
+        }
+    }
+
     function loadPlaylist(context, player) {
         getPlaylistItems(player).then(function (items) {
             if (items.length === 0) {
                 return;
             }
+
+            const itemsContainer = context.querySelector('.playlist');
+            const queueKey = items.map(item => item.PlaylistItemId + '|' + item.Id).join();
+
+            if (queueKey === renderedQueueKey && itemsContainer.querySelector('.listItem')) {
+                // The queue didn't change, only move the current item indicator
+                updatePlaylistIndicator(itemsContainer, player);
+                return;
+            }
+
+            renderedQueueKey = queueKey;
 
             let html = '';
             let favoritesEnabled = true;
@@ -477,7 +521,6 @@ export default function () {
                 dragHandle: true
             });
 
-            const itemsContainer = context.querySelector('.playlist');
             let focusedItemPlaylistId = itemsContainer.querySelector('button:focus');
             itemsContainer.innerHTML = html;
             if (focusedItemPlaylistId !== null) {
@@ -488,17 +531,7 @@ export default function () {
                 }
             }
 
-            const playlistItemId = playbackManager.getCurrentPlaylistItemId(player);
-
-            if (playlistItemId) {
-                const img = itemsContainer.querySelector(`.listItem[data-playlistItemId="${playlistItemId}"] .listItemImage`);
-
-                if (img) {
-                    img.classList.remove('lazy');
-                    img.classList.add('playlistIndexIndicatorImage');
-                    img.classList.toggle('playlistIndexIndicatorPausedImage', playbackManager.paused());
-                }
-            }
+            updatePlaylistIndicator(itemsContainer, player);
 
             imageLoader.lazyChildren(itemsContainer);
         });
@@ -545,6 +578,8 @@ export default function () {
         const context = dlg;
         if (info !== undefined) {
             const playlistItemIds = info.playlistItemIds;
+            // The rendered queue no longer matches the last rendered one
+            renderedQueueKey = null;
 
             for (let i = 0, length = playlistItemIds.length; i < length; i++) {
                 const listItem = context.querySelector('.listItem[data-playlistItemId="' + playlistItemIds[i] + '"]');
@@ -617,6 +652,7 @@ export default function () {
     function bindToPlayer(context, player) {
         releaseCurrentPlayer();
         currentPlayer = player;
+        renderedQueueKey = null;
 
         if (player) {
             const state = playbackManager.getPlayerState(player);
@@ -907,6 +943,7 @@ export default function () {
         releaseCurrentPlayer();
         Events.off(playbackManager, 'playerchange', onPlayerChange);
         lastPlayerState = null;
+        renderedQueueKey = null;
     }
 
     function onShow(context) {
@@ -922,6 +959,8 @@ export default function () {
     let currentPlayerSupportedCommands = [];
     let lastUpdateTime = 0;
     let currentRuntimeTicks = 0;
+    /** Key of the rendered play queue, used to only rebuild the queue when it changed. */
+    let renderedQueueKey = null;
     const self = this;
 
     self.init = function (ownerView, context) {

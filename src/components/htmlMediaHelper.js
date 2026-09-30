@@ -21,11 +21,80 @@ export function getCrossOriginValue(mediaSource) {
     return 'anonymous';
 }
 
+let _canPlayNativeHls;
 function canPlayNativeHls() {
-    const media = document.createElement('video');
+    // canPlayType results do not change during a session
+    if (_canPlayNativeHls == null) {
+        const media = document.createElement('video');
 
-    return !!(media.canPlayType('application/x-mpegURL').replace(/no/, '')
-            || media.canPlayType('application/vnd.apple.mpegURL').replace(/no/, ''));
+        _canPlayNativeHls = !!(media.canPlayType('application/x-mpegURL').replace(/no/, '')
+                || media.canPlayType('application/vnd.apple.mpegURL').replace(/no/, ''));
+    }
+
+    return _canPlayNativeHls;
+}
+
+let hlsJsPromise;
+/**
+ * Loads hls.js (once) and applies the default configuration.
+ * @returns {Promise<any>} Promise resolving to the hls.js class.
+ */
+export function loadHlsJs() {
+    if (!hlsJsPromise) {
+        hlsJsPromise = import('hls.js/dist/hls.js').then(({ default: hls }) => {
+            hls.DefaultConfig.lowLatencyMode = false;
+            // A finite back buffer lets hls.js evict played media before the MSE quota is hit
+            hls.DefaultConfig.backBufferLength = (browser.tv || browser.slow) ? 30 : 90;
+            hls.DefaultConfig.liveBackBufferLength = 90;
+            window.Hls = hls;
+            return hls;
+        }, (err) => {
+            // Allow a retry on the next playback
+            hlsJsPromise = null;
+            throw err;
+        });
+    }
+
+    return hlsJsPromise;
+}
+
+const UNIVERSAL_AUDIO_URL_REGEX = /\/audio\/[^/]+\/universal(\.[^/]*)?$/i;
+const PROGRESSIVE_AUDIO_URL_REGEX = /\/audio\/[^/]+\/stream(\.[^/]*)?$/i;
+
+/**
+ * Decides from the URL alone whether a stream is HLS.
+ * @param {string} url - The stream url.
+ * @returns {boolean|null} _true_ if HLS, _false_ if not HLS, _null_ if the server decides at request time.
+ */
+export function isHlsStreamUrl(url) {
+    if (!url) {
+        return null;
+    }
+
+    if (url.indexOf('.m3u8') !== -1) {
+        return true;
+    }
+
+    const [path, query = ''] = url.split('#')[0].split('?');
+
+    // /Audio/{id}/stream is always a progressive (non HLS) response
+    if (PROGRESSIVE_AUDIO_URL_REGEX.test(path)) {
+        return false;
+    }
+
+    if (UNIVERSAL_AUDIO_URL_REGEX.test(path)) {
+        const protocolParam = query.split('&').find(p => p.toLowerCase().startsWith('transcodingprotocol='));
+        const protocol = protocolParam ? decodeURIComponent(protocolParam.split('=')[1] || '').toLowerCase() : '';
+
+        // The universal endpoint only answers with HLS when transcoding over HLS.
+        // With an explicit non-HLS protocol it is always a progressive response.
+        // Otherwise the server decides between direct stream and HLS transcode (needs a HEAD request).
+        if (protocol && protocol !== 'hls') {
+            return false;
+        }
+    }
+
+    return null;
 }
 
 export function enableHlsJsPlayerForCodecs(mediaSource, mediaType) {
@@ -125,6 +194,16 @@ export function isValidDuration(duration) {
             && duration !== Number.NEGATIVE_INFINITY;
 }
 
+const pendingSeekCleanups = new WeakMap();
+
+/**
+ * Removes the listeners registered by seekOnPlaybackStart that are still waiting for the media to be ready.
+ * @param {HTMLMediaElement} element - The media element.
+ */
+export function cancelSeekOnPlaybackStart(element) {
+    pendingSeekCleanups.get(element)?.();
+}
+
 function setCurrentTimeIfNeeded(element, seconds) {
     // If it's worth skipping (1 sec or less of a difference)
     if (Math.abs((element.currentTime || 0) - seconds) >= 1) {
@@ -134,6 +213,9 @@ function setCurrentTimeIfNeeded(element, seconds) {
 
 export function seekOnPlaybackStart(instance, element, ticks, onMediaReady) {
     const seconds = (ticks || 0) / 10000000;
+
+    // Never let listeners of a previous playback seek this one
+    cancelSeekOnPlaybackStart(element);
 
     if (seconds) {
         // Appending #t=xxx to the query string doesn't seem to work with HLS
@@ -146,6 +228,14 @@ export function seekOnPlaybackStart(instance, element, ticks, onMediaReady) {
         } else {
             // update video player position when media is ready to be sought
             const events = ['durationchange', 'loadeddata', 'play', 'loadedmetadata'];
+            const removeListeners = function () {
+                events.forEach(name => {
+                    element.removeEventListener(name, onMediaChange);
+                });
+                if (pendingSeekCleanups.get(element) === removeListeners) {
+                    pendingSeekCleanups.delete(element);
+                }
+            };
             const onMediaChange = function(e) {
                 if (element.currentTime === 0 && element.duration >= seconds) {
                     // seek only when video position is exactly zero,
@@ -154,15 +244,14 @@ export function seekOnPlaybackStart(instance, element, ticks, onMediaReady) {
                     // (but rewinding cannot happen as the first event with media of non-empty duration)
                     console.debug(`seeking to ${seconds} on ${e.type} event`);
                     setCurrentTimeIfNeeded(element, seconds);
-                    events.forEach(name => {
-                        element.removeEventListener(name, onMediaChange);
-                    });
+                    removeListeners();
                     if (onMediaReady) onMediaReady();
                 }
             };
             events.forEach(name => {
                 element.addEventListener(name, onMediaChange);
             });
+            pendingSeekCleanups.set(element, removeListeners);
         }
     }
 }
@@ -342,6 +431,8 @@ export function bindEventsToHlsPlayer(instance, hls, elem, onErrorFn, resolve, r
 export function onEndedInternal(instance, elem, onErrorFn) {
     elem.removeEventListener('error', onErrorFn);
 
+    cancelSeekOnPlaybackStart(elem);
+
     resetSrc(elem);
 
     destroyHlsPlayer(instance);
@@ -357,6 +448,71 @@ export function onEndedInternal(instance, elem, onErrorFn) {
     instance._currentTime = null;
     instance._currentSrc = null;
     instance._currentPlayOptions = null;
+}
+
+const trackEventsInfoCache = new WeakMap();
+
+function getTrackEventsInfo(trackEvents) {
+    let info = trackEventsInfoCache.get(trackEvents);
+    if (!info) {
+        let sorted = true;
+        let maxDuration = 0;
+        for (let i = 0; i < trackEvents.length; i++) {
+            const { StartPositionTicks: start, EndPositionTicks: end } = trackEvents[i];
+            if (!Number.isFinite(start) || !Number.isFinite(end)
+                    || (i > 0 && start < trackEvents[i - 1].StartPositionTicks)) {
+                sorted = false;
+                break;
+            }
+            maxDuration = Math.max(maxDuration, end - start);
+        }
+        // Offsets shift all events equally, so these stay valid for the lifetime of the array
+        info = { sorted, maxDuration };
+        trackEventsInfoCache.set(trackEvents, info);
+    }
+    return info;
+}
+
+/**
+ * Finds the first track event (in array order) that is active at the given position.
+ * Uses a binary search when the events are sorted by start position.
+ * @param {Array<{StartPositionTicks: number, EndPositionTicks: number}>} trackEvents - The track events.
+ * @param {number} ticks - The position in ticks.
+ * @returns {object|undefined} The active track event.
+ */
+export function findActiveTrackEvent(trackEvents, ticks) {
+    if (!trackEvents?.length) {
+        return undefined;
+    }
+
+    const { sorted, maxDuration } = getTrackEventsInfo(trackEvents);
+
+    let start = 0;
+    if (sorted) {
+        // Events starting before this cannot still be active
+        const lowerBound = ticks - maxDuration;
+        let high = trackEvents.length;
+        while (start < high) {
+            const mid = (start + high) >>> 1;
+            if (trackEvents[mid].StartPositionTicks < lowerBound) {
+                start = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+    }
+
+    for (let i = start; i < trackEvents.length; i++) {
+        const trackEvent = trackEvents[i];
+        if (sorted && trackEvent.StartPositionTicks > ticks) {
+            break;
+        }
+        if (trackEvent.StartPositionTicks <= ticks && trackEvent.EndPositionTicks >= ticks) {
+            return trackEvent;
+        }
+    }
+
+    return undefined;
 }
 
 export function getBufferedRanges(instance, elem) {

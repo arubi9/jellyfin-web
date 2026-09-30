@@ -195,31 +195,80 @@ const detectBitrateWithEndpointInfo = (api: Api, endpointInfo: EndPointInfo) => 
     });
 };
 
+/** Returns the bitrate detected during this session if it is still fresh */
+const getFreshBitrate = () => {
+    if (lastDetectedBitrate
+        && Date.now() - (lastDetectedBitrateTime || 0) <= BITRATE_CACHE_DURATION) {
+        return lastDetectedBitrate;
+    }
+
+    return null;
+};
+
 /**
  * Detects the bitrate on the current device
  * @param {Api} api The Api client
  * @param {boolean} force Ignore the cached bitrate and force a re-detection
+ * @param {EndPointInfo} endpointInfo Known endpoint info, avoids requesting it again
  * @returns {number} The detected bitrate
  */
-export const detectBitrate = (api: Api, force: boolean) => {
-    if (!force
-        && lastDetectedBitrate
-        && Date.now() - (lastDetectedBitrateTime || 0) <= BITRATE_CACHE_DURATION) {
-        return Promise.resolve(lastDetectedBitrate);
+export const detectBitrate = (api: Api, force?: boolean, endpointInfo?: EndPointInfo) => {
+    const freshBitrate = force ? null : getFreshBitrate();
+    if (freshBitrate) {
+        return Promise.resolve(freshBitrate);
     }
 
     if (pendingBitrateDetection) {
         return pendingBitrateDetection;
     }
 
-    pendingBitrateDetection = getSystemApi(api)
-        .getEndpointInfo()
-        .then(
-            (response) => detectBitrateWithEndpointInfo(api, response.data),
-            () => detectBitrateWithEndpointInfo(api, {})
-        ).finally(() => {
+    const endpointInfoPromise = endpointInfo ?
+        Promise.resolve(endpointInfo) :
+        getSystemApi(api)
+            .getEndpointInfo()
+            .then(response => response.data, () => ({}));
+
+    pendingBitrateDetection = endpointInfoPromise
+        .then(info => detectBitrateWithEndpointInfo(api, info))
+        .finally(() => {
             pendingBitrateDetection = null;
         });
 
     return pendingBitrateDetection;
+};
+
+/**
+ * Gets the bitrate to start playback with, without waiting for a speed test when a previous result is known.
+ * A bitrate detected earlier in this session is used as long as it is fresh. Otherwise, when a previously
+ * detected (saved) bitrate exists, it is returned immediately while a new detection runs in the background.
+ * Only when nothing is known yet does this wait for the detection.
+ * @param {Api} api The Api client
+ * @param {EndPointInfo} endpointInfo Endpoint info of the server
+ * @param {number | null | undefined} savedBitrate A previously detected bitrate (e.g. from a previous session)
+ * @param {Function} onDetected Called with every newly detected bitrate, e.g. to save it for next time
+ * @returns {Promise<number>} The bitrate to use
+ */
+export const getBitrate = (
+    api: Api,
+    endpointInfo: EndPointInfo,
+    savedBitrate: number | null | undefined,
+    onDetected: (bitrate: number) => void
+): Promise<number> => {
+    const freshBitrate = getFreshBitrate();
+    if (freshBitrate) {
+        return Promise.resolve(freshBitrate);
+    }
+
+    const detection = detectBitrate(api, false, endpointInfo).then(bitrate => {
+        onDetected(bitrate);
+        return bitrate;
+    });
+
+    if (savedBitrate && savedBitrate > 0) {
+        // Refresh in the background, the result is used from the next playback on
+        detection.catch(err => console.error('[bitratetest] background detection failed', err));
+        return Promise.resolve(savedBitrate);
+    }
+
+    return detection;
 };

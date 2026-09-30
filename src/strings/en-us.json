@@ -817,7 +817,7 @@
     "LabelLanNetworks": "LAN networks",
     "LabelLevel": "Level",
     "LabelLibraryPageSize": "Library page size",
-    "LabelLibraryPageSizeHelp": "Set the amount of items to show on a library page. Setting a value of 0 will disable pagination. Please note that setting this to 0 or any value greater than 100 may lead to bugs and reduced performance.",
+    "LabelLibraryPageSizeHelp": "Set the amount of items to show on a library page, up to 1000. A value of 0 uses the maximum. Please note that values greater than 100 may lead to reduced performance.",
     "LabelMaxDaysForNextUp": "Max days in 'Next Up'",
     "LabelMaxDaysForNextUpHelp": "Set the maximum amount of days a show should stay in the 'Next Up' list without watching it.",
     "LabelMaxVideoResolution": "Maximum Allowed Video Transcoding Resolution",

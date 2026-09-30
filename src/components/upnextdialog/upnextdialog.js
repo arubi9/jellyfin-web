@@ -52,6 +52,12 @@ function setNextVideoText() {
 
     const secondsRemaining = Math.max(Math.round(getTimeRemainingMs(instance) / 1000), 0);
 
+    // The text only changes once per second (or never, with the static text)
+    if (secondsRemaining === instance._lastSecondsRemaining) {
+        return;
+    }
+    instance._lastSecondsRemaining = secondsRemaining;
+
     console.debug('up next seconds remaining: ' + secondsRemaining);
 
     const timeText = '<span class="upNextDialog-countdownText">' + globalize.translate('HeaderSecondsValue', secondsRemaining) + '</span>';
@@ -101,13 +107,14 @@ function clearCountdownTextTimeout(instance) {
     }
 }
 
-async function onStartNowClick() {
+function onStartNowClick() {
     const options = this.options;
 
     if (options) {
         const player = options.player;
 
-        await this.hide();
+        // Don't wait for the hide animation: start the next item right away
+        this.hide();
 
         playbackManager.nextTrack(player);
     }
@@ -132,15 +139,19 @@ function clearHideAnimationEventListeners(instance, elem) {
     const fn = instance._onHideAnimationComplete;
 
     if (fn) {
-        dom.removeEventListener(elem, transitionEndEventName, fn, {
-            once: true
-        });
+        dom.removeEventListener(elem, transitionEndEventName, fn);
+        instance._onHideAnimationComplete = null;
     }
 }
 
 function onHideAnimationComplete(e) {
     const instance = this;
-    const elem = e.target;
+    const elem = instance.options?.parent || e.currentTarget;
+
+    // Ignore transitions of the child elements (buttons)
+    if (e.target !== elem) {
+        return;
+    }
 
     elem.classList.add('hide');
 
@@ -148,7 +159,7 @@ function onHideAnimationComplete(e) {
     Events.trigger(instance, 'hide');
 }
 
-async function hideComingUpNext() {
+function hideComingUpNext() {
     const instance = this;
     clearCountdownTextTimeout(this);
 
@@ -162,27 +173,27 @@ async function hideComingUpNext() {
         return;
     }
 
+    const pendingHide = instance._onHideAnimationComplete;
     clearHideAnimationEventListeners(this, elem);
 
     if (elem.classList.contains('upNextDialog-hidden')) {
+        if (pendingHide) {
+            // A hide animation is still running: finish it now, or 'hide' would never fire
+            elem.classList.add('hide');
+            Events.trigger(instance, 'hide');
+        }
         return;
     }
 
     const fn = onHideAnimationComplete.bind(instance);
     instance._onHideAnimationComplete = fn;
 
-    const transitionEvent = await new Promise((resolve) => {
-        dom.addEventListener(elem, transitionEndEventName, resolve, {
-            once: true
-        });
+    dom.addEventListener(elem, transitionEndEventName, fn);
 
-        // trigger a reflow to force it to animate again
-        void elem.offsetWidth;
+    // trigger a reflow to force it to animate again
+    void elem.offsetWidth;
 
-        elem.classList.add('upNextDialog-hidden');
-    });
-
-    instance._onHideAnimationComplete(transitionEvent);
+    elem.classList.add('upNextDialog-hidden');
 }
 
 function getTimeRemainingMs(instance) {
@@ -210,7 +221,7 @@ function startComingUpNextHideTimer(instance) {
     setNextVideoText.call(instance);
     clearCountdownTextTimeout(instance);
 
-    if (!instance.showStaticNextText) instance._countdownTextTimeout = setInterval(setNextVideoText.bind(instance), 400);
+    if (!instance.showStaticNextText) instance._countdownTextTimeout = setInterval(setNextVideoText.bind(instance), 1000);
 }
 
 async function showStaticNextText(nextItem) {
@@ -246,8 +257,8 @@ class UpNextDialog {
 
         startComingUpNextHideTimer(this);
     }
-    async hide() {
-        await hideComingUpNext.bind(this)();
+    hide() {
+        hideComingUpNext.call(this);
     }
     destroy() {
         hideComingUpNext.call(this);

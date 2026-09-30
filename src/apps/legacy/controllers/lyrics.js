@@ -49,8 +49,13 @@ function getCurrentPlayTime() {
 }
 
 export default function (view) {
+    /** Lyric line elements of the rendered lyrics, indexed by line. */
+    let lyricLineElements = [];
+    /** Index of the current lyric line, undefined if the lines were never updated. */
+    let currentLyricIndex;
+
     function setPastLyricClassOnLine(line) {
-        const lyric = view.querySelector(`#lyricPosition${line}`);
+        const lyric = lyricLineElements[line];
         if (lyric) {
             lyric.classList.remove('futureLyric');
             lyric.classList.add('pastLyric');
@@ -58,7 +63,7 @@ export default function (view) {
     }
 
     function setFutureLyricClassOnLine(line) {
-        const lyric = view.querySelector(`#lyricPosition${line}`);
+        const lyric = lyricLineElements[line];
         if (lyric) {
             lyric.classList.remove('pastLyric');
             lyric.classList.add('futureLyric');
@@ -66,7 +71,7 @@ export default function (view) {
     }
 
     function setCurrentLyricClassOnLine(line) {
-        const lyric = view.querySelector(`#lyricPosition${line}`);
+        const lyric = lyricLineElements[line];
         if (lyric) {
             lyric.classList.remove('pastLyric');
             lyric.classList.remove('futureLyric');
@@ -79,8 +84,16 @@ export default function (view) {
         }
     }
 
-    function updateAllLyricLines(currentLine, lyrics) {
-        for (let lyricIndex = 0; lyricIndex <= lyrics.length; lyricIndex++) {
+    function updateAllLyricLines(currentLine) {
+        if (currentLine === currentLyricIndex) return;
+
+        // Only update the lines whose state changed since the last update (the setters ignore out-of-range lines)
+        const [from, to] = currentLyricIndex === undefined ?
+            [0, lyricLineElements.length - 1] :
+            [Math.min(currentLyricIndex, currentLine), Math.max(currentLyricIndex, currentLine)];
+        currentLyricIndex = currentLine;
+
+        for (let lyricIndex = from; lyricIndex <= to; lyricIndex++) {
             if (lyricIndex < currentLine) {
                 setPastLyricClassOnLine(lyricIndex);
             } else if (lyricIndex === currentLine) {
@@ -100,7 +113,14 @@ export default function (view) {
         autoFocuser.autoFocus();
     }
 
+    function resetLyricLines() {
+        lyricLineElements = [];
+        currentLyricIndex = undefined;
+    }
+
     function renderLyrics(lyrics) {
+        resetLyricLines();
+
         const itemsContainer = view.querySelector('.lyricsContainer');
         if (itemsContainer) {
             const html = lyrics.reduce(lyricHtmlReducer, '');
@@ -109,6 +129,7 @@ export default function (view) {
 
         if (isDynamicLyric) {
             const lyricLineArray = itemsContainer.querySelectorAll('.lyricsLine');
+            lyricLineElements = Array.from(lyricLineArray);
 
             // attaches click event listener to change playtime to lyric start
             lyricLineArray.forEach(element => {
@@ -116,7 +137,7 @@ export default function (view) {
             });
 
             const currentIndex = getLyricIndex(getCurrentPlayTime(), lyrics);
-            updateAllLyricLines(currentIndex, savedLyrics);
+            updateAllLyricLines(currentIndex);
         }
     }
 
@@ -177,6 +198,8 @@ export default function (view) {
 
     function onLyricClick(lyricTime) {
         autoScroll = AutoScroll.Smooth;
+        // Force a full update (and scroll) on the next time update, even if the clicked line is the current one
+        currentLyricIndex = undefined;
         playbackManager.seek(lyricTime);
         if (playbackManager.paused()) {
             playbackManager.playPause(currentPlayer);
@@ -186,7 +209,7 @@ export default function (view) {
     function onTimeUpdate() {
         if (isDynamicLyric) {
             const currentIndex = getLyricIndex(getCurrentPlayTime(), savedLyrics);
-            updateAllLyricLines(currentIndex, savedLyrics);
+            updateAllLyricLines(currentIndex);
         }
     }
 
@@ -212,6 +235,7 @@ export default function (view) {
         savedLyrics = null;
         currentItem = null;
         isDynamicLyric = false;
+        resetLyricLines();
 
         LibraryMenu.setTitle(globalize.translate('Lyrics'));
 

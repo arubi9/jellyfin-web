@@ -38,6 +38,15 @@ import { bindSkipSegment } from './skipsegment.ts';
 import * as bitrateTest from 'utils/bitrateTest';
 
 const UNLIMITED_ITEMS = -1;
+// How long the next item fetched by nextItem() (e.g. for the up next dialog) is reused to start playing it
+const NEXT_ITEM_PREFETCH_MAX_AGE = 10 * 60 * 1000;
+// Minimum interval between progress updates for timeupdate events
+const TIMEUPDATE_THROTTLE_MS = 1000;
+// Position difference to the expected position treated as a seek (matches the apiclient's progress throttling)
+const TIMEUPDATE_SEEK_TICKS = 5 * TICKS_PER_SECOND;
+// ponytail: hard cap on "unlimited" queue queries so huge folders don't load every item with full media info;
+// page the queue if users need more than this.
+const MAX_QUEUE_ITEMS = 5000;
 
 function enableLocalPlaylistManagement(player) {
     if (player.getPlaylist) {
@@ -145,7 +154,7 @@ function getItemsForPlayback(serverId, query) {
         });
     } else {
         if (query.Limit === UNLIMITED_ITEMS) {
-            delete query.Limit;
+            query.Limit = MAX_QUEUE_ITEMS;
         } else {
             query.Limit = query.Limit || 300;
         }
@@ -276,6 +285,51 @@ function getIntros(firstItem, apiClient, options) {
             Items: []
         });
     });
+}
+
+/**
+ * Fields to request for an episode queue.
+ * Queues managed here only need light items: the media sources, chapters and trickplay data of the
+ * item actually played are taken from the item fetched for playback (see completeQueueItem).
+ * Players managing their own playlist get the queue as is, so they keep receiving full items.
+ */
+function getEpisodeQueueFields(player) {
+    if (player && enableLocalPlaylistManagement(player)) {
+        return undefined;
+    }
+
+    return [ItemFields.Chapters, ItemFields.MediaSources, ItemFields.Trickplay];
+}
+
+/**
+ * Adds the playback related data of a fully fetched item to a (light) queue item of the same id.
+ * The queue item is updated in place so that replaying it does not need another fetch.
+ */
+function completeQueueItem(item, fullItem) {
+    if (!fullItem || fullItem.Id !== item.Id) {
+        return;
+    }
+
+    item.MediaSources ??= fullItem.MediaSources;
+    item.Chapters ??= fullItem.Chapters;
+    item.Trickplay ??= fullItem.Trickplay;
+}
+
+// Album normalization gain requests, per server and album, shared by the tracks of an album
+const albumNormalizationGains = new Map();
+
+function getAlbumNormalizationGain(apiClient, albumId) {
+    const key = apiClient.serverId() + '|' + albumId;
+    let promise = albumNormalizationGains.get(key);
+
+    if (!promise) {
+        promise = apiClient.getItem(apiClient.getCurrentUserId(), albumId).then(album => album.NormalizationGain);
+        albumNormalizationGains.set(key, promise);
+        // Allow a later track to retry
+        promise.catch(() => albumNormalizationGains.delete(key));
+    }
+
+    return promise;
 }
 
 function getAudioMaxValues(deviceProfile) {
@@ -1423,7 +1477,12 @@ export class PlaybackManager {
                 let promise;
                 if (options.enableAutomaticBitrateDetection) {
                     appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType, true);
-                    promise = bitrateTest.detectBitrate(api, true);
+                    promise = bitrateTest.detectBitrate(api, true, endpointInfo).then(function (bitrate) {
+                        if (bitrate > 0) {
+                            appSettings.detectedBitrate(endpointInfo.IsInNetwork, bitrate);
+                        }
+                        return bitrate;
+                    });
                 } else {
                     appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType, false);
                     promise = Promise.resolve(options.maxBitrate);
@@ -1843,8 +1902,11 @@ export class PlaybackManager {
         function sortItemsIfNeeded(items, options) {
             if (items.length > 1 && options?.ids) {
                 // Use the original request id array for sorting the result in the proper order
+                // Reversed so the first occurrence of a duplicate id wins
+                const idIndexes = new Map(options.ids.map((id, index) => [id, index]).reverse());
+
                 items.sort(function (a, b) {
-                    return options.ids.indexOf(a.Id) - options.ids.indexOf(b.Id);
+                    return (idIndexes.get(a.Id) ?? -1) - (idIndexes.get(b.Id) ?? -1);
                 });
             }
         }
@@ -1943,6 +2005,8 @@ export class PlaybackManager {
                     }).indexOf(firstItem.Id);
 
                     if (index === -1) {
+                        // The selected item can fall outside the capped queue; still start with it
+                        playbackItems.unshift(firstItem);
                         index = 0;
                     }
 
@@ -2010,6 +2074,9 @@ export class PlaybackManager {
                 startItemId = nextUp?.Items?.[0]?.Id;
             }
 
+            // The queue holds episodes (videos), so resolve the player for a video item
+            const player = getPlayer({ ...firstItem, MediaType: MediaType.Video }, options);
+
             const episodesResult = await apiClient.getEpisodes(SeriesId, {
                 IsVirtualUnaired: false,
                 IsMissing: false,
@@ -2018,7 +2085,7 @@ export class PlaybackManager {
                 limit: seasonId ? undefined : 100,
                 SortBy: options.shuffle ? 'Random' : undefined,
                 UserId,
-                Fields: [ItemFields.Chapters, ItemFields.MediaSources, ItemFields.Trickplay],
+                Fields: getEpisodeQueueFields(player),
                 startItemId
             });
 
@@ -2075,7 +2142,7 @@ export class PlaybackManager {
                     IsVirtualUnaired: false,
                     IsMissing: false,
                     UserId: apiClient.getCurrentUserId(),
-                    Fields: [ItemFields.Chapters, ItemFields.MediaSources, ItemFields.Trickplay],
+                    Fields: getEpisodeQueueFields(getPlayer(firstItem, options)),
                     // limit to loading 100 episodes to avoid loading too large payload
                     limit: 100,
                     startItemId: Id
@@ -2091,6 +2158,10 @@ export class PlaybackManager {
                 if (e.Id === firstItem.Id) {
                     episodesResult.StartIndex = index;
                     startItemFound = true;
+                    // Reuse the playback data of the already fully fetched start item
+                    if (firstItem.MediaSources && firstItem.Chapters) {
+                        completeQueueItem(e, firstItem);
+                    }
                     break;
                 }
             }
@@ -2141,6 +2212,15 @@ export class PlaybackManager {
                 })).Items;
             }
 
+            // Request the intros of the requested start item while the queue is prepared.
+            // playWithIntros only uses the result if that item is still the one to start with.
+            // (Intros are never played with a start index, so there is nothing to request then)
+            const startItem = options.startIndex ? null : items[0];
+            const speculativeIntros = startItem && {
+                itemId: startItem.Id,
+                promise: getIntros(startItem, ServerConnections.getApiClient(startItem.ServerId), options)
+            };
+
             // Prepare the list of items
             items = await translateItemsForPlayback(items, options);
             // Add any additional parts for movies or episodes
@@ -2157,7 +2237,7 @@ export class PlaybackManager {
             // getAdditionalParts returns an array of arrays of items, so flatten it
             items = items.flat();
 
-            return playWithIntros(items, options);
+            return playWithIntros(items, options, speculativeIntros);
         };
 
         function getPlayerData(player) {
@@ -2324,7 +2404,7 @@ export class PlaybackManager {
             return Promise.all(items.map((item, index) => getItemAndParts(item, index === (startIndex || 0))));
         };
 
-        function playWithIntros(items, options) {
+        function playWithIntros(items, options, speculativeIntros) {
             let playStartIndex = options.startIndex || 0;
             let firstItem = items[playStartIndex];
 
@@ -2346,7 +2426,12 @@ export class PlaybackManager {
 
             const apiClient = ServerConnections.getApiClient(firstItem.ServerId);
 
-            return getIntros(firstItem, apiClient, options).then(function (introsResult) {
+            // Only the start index can have changed the outcome of getIntros for the same item
+            const introsPromise = (speculativeIntros?.itemId === firstItem.Id && !options.startIndex) ?
+                speculativeIntros.promise :
+                getIntros(firstItem, apiClient, options);
+
+            return introsPromise.then(function (introsResult) {
                 const introItems = introsResult.Items;
                 let introPlayOptions;
 
@@ -2420,7 +2505,10 @@ export class PlaybackManager {
             const player = self._currentPlayer;
 
             if (player) {
+                stopPlaybackProgressTimer(player);
                 destroyPlayer(player);
+                // destroy() does not trigger 'stopped', so drop the stream info here to stop reporting progress for it
+                getPlayerData(player).streamInfo = null;
                 removeCurrentPlayer(player);
             }
 
@@ -2618,12 +2706,32 @@ export class PlaybackManager {
 
                     return apiClient.getEndpointInfo()
                         .then((endpointInfo) => {
-                            if ((mediaType === 'Video' || mediaType === 'Audio') && appSettings.enableAutomaticBitrateDetection(endpointInfo.IsInNetwork, mediaType)) {
-                                return bitrateTest.detectBitrate(api)
-                                    .then((bitrate) => {
-                                        appSettings.maxStreamingBitrate(endpointInfo.IsInNetwork, mediaType, bitrate);
-                                        return bitrate;
-                                    });
+                            const isInNetwork = endpointInfo.IsInNetwork;
+
+                            // In network audio always uses the maximum bitrate, a speed test would not change it
+                            if (isInNetwork && mediaType === 'Audio') {
+                                return Promise.reject(new Error('skip bitrate detection'));
+                            }
+
+                            if ((mediaType === 'Video' || mediaType === 'Audio') && appSettings.enableAutomaticBitrateDetection(isInNetwork, mediaType)) {
+                                const saveBitrate = (bitrate) => {
+                                    appSettings.maxStreamingBitrate(isInNetwork, mediaType, bitrate);
+                                };
+
+                                // Start with the last detected bitrate (if any) and refresh it in the background
+                                return bitrateTest.getBitrate(api, endpointInfo, appSettings.detectedBitrate(isInNetwork), (bitrate) => {
+                                    // Keep the last good value if the test failed
+                                    if (bitrate > 0) {
+                                        appSettings.detectedBitrate(isInNetwork, bitrate);
+                                        // The user may have picked a manual quality while the test was running
+                                        if (appSettings.enableAutomaticBitrateDetection(isInNetwork, mediaType)) {
+                                            saveBitrate(bitrate);
+                                        }
+                                    }
+                                }).then((bitrate) => {
+                                    saveBitrate(bitrate);
+                                    return bitrate;
+                                });
                             }
 
                             return Promise.reject(new Error('skip bitrate detection'));
@@ -2678,22 +2786,71 @@ export class PlaybackManager {
 
             const apiClient = ServerConnections.getApiClient(item.ServerId);
             const isLiveTv = [BaseItemKind.TvChannel, BaseItemKind.LiveTvChannel].includes(item.Type);
-            const getSourceItem = isLiveTv ? Promise.resolve(null) : apiClient.getItem(apiClient.getCurrentUserId(), mediaSourceId || item.Id);
+            // Audio is streamed from a url built locally, which does not use a version or track selection
+            const isStreamedAudio = item.MediaType === 'Audio' && !itemHelper.isLocalItem(item) && !player.useServerPlaybackInfoForAudio;
 
-            return Promise.all([promise, player.getDeviceProfile(item), apiClient.getCurrentUser(), getSourceItem]).then(function (responses) {
+            // Item requests of this playback attempt, by id (the next item may already be requested by nextItem)
+            const itemRequests = new Map();
+            const prefetch = self._nextItemPrefetch;
+            self._nextItemPrefetch = null;
+            if (prefetch?.serverId === item.ServerId && Date.now() - prefetch.time < NEXT_ITEM_PREFETCH_MAX_AGE) {
+                // Fall back to a new request if the prefetch failed
+                const request = prefetch.promise.catch(() => apiClient.getItem(apiClient.getCurrentUserId(), prefetch.id));
+                request.catch(() => { /* handled by the consumer */ });
+                itemRequests.set(prefetch.id, request);
+            }
+            const getPlaybackItem = (id) => {
+                if (!itemRequests.has(id)) {
+                    const request = apiClient.getItem(apiClient.getCurrentUserId(), id);
+                    // Avoid unhandled rejection noise for requests that end up unused
+                    request.catch(() => { /* handled by the consumer */ });
+                    itemRequests.set(id, request);
+                }
+                return itemRequests.get(id);
+            };
+
+            // Queued items which carry their media sources do not need to be fetched again (e.g. an item played
+            // by id was just fetched in full), unless another version is requested (for its chapters and trickplay).
+            // Otherwise the item (or the requested version) is fetched: it is only waited for before requesting
+            // playback info when it is needed to pick the version or tracks to continue with, else it is loaded
+            // in parallel.
+            const ownSources = item.MediaSources;
+            const sourceItemId = mediaSourceId || item.Id;
+            const hasOwnSource = !!ownSources?.some(s => s.Id === sourceItemId);
+            const needsSourceItem = !isLiveTv && !isStreamedAudio && (!hasOwnSource || sourceItemId !== item.Id);
+            const sourceItemPromise = needsSourceItem ? getPlaybackItem(sourceItemId) : null;
+            const waitForSourceItem = needsSourceItem && !hasOwnSource && !!prevSource;
+
+            return Promise.all([
+                promise,
+                player.getDeviceProfile(item),
+                apiClient.getCurrentUser(),
+                waitForSourceItem ? sourceItemPromise : null
+            ]).then(function (responses) {
                 const deviceProfile = responses[1];
                 const user = responses[2];
                 const sourceItem = responses[3];
 
+                completeQueueItem(item, sourceItem);
+
                 // Queued items do not always carry their media sources, in which case the version
                 // to keep playing can only be matched on the item fetched for playback.
-                const versionSource = mediaSourceId ? null : getMatchingMediaSource(sourceItem?.MediaSources, prevSource);
+                const versionSource = mediaSourceId ? null : getMatchingMediaSource(ownSources || sourceItem?.MediaSources, prevSource);
 
                 if (versionSource) {
                     mediaSourceId = versionSource.Id;
+
+                    // Load the chapters and trickplay data of that version in parallel with the playback info
+                    if (mediaSourceId !== item.Id && !isStreamedAudio) {
+                        getPlaybackItem(mediaSourceId);
+                    }
                 }
 
-                const mediaStreams = versionSource?.MediaStreams || sourceItem?.MediaStreams || [];
+                // Same as the MediaStreams of the fetched item: the streams of its own media source
+                const ownSource = (!sourceItem && !isStreamedAudio && ownSources) ?
+                    ownSources.find(s => s.Id === (mediaSourceId || item.Id)) :
+                    null;
+                const mediaStreams = versionSource?.MediaStreams || ownSource?.MediaStreams || sourceItem?.MediaStreams || [];
 
                 const audioStreamIndex = playOptions.audioStreamIndex;
                 const subtitleStreamIndex = playOptions.subtitleStreamIndex;
@@ -2755,7 +2912,16 @@ export class PlaybackManager {
                         mediaSource.DefaultSecondarySubtitleStreamIndex = -1;
                     }
 
-                    const playedItem = await getItemOfMediaSource(apiClient, item, mediaSource, sourceItem);
+                    if (sourceItemPromise) {
+                        // Only chapters and trickplay depend on it from here on, so play without them if it failed
+                        completeQueueItem(item, await sourceItemPromise.catch(() => null));
+
+                        if (item.MediaSources?.length > 1) {
+                            mediaSource.hasAlternateVersions = true;
+                        }
+                    }
+
+                    const playedItem = await getItemOfMediaSource(item, mediaSource, getPlaybackItem);
 
                     const streamInfo = createStreamInfo(apiClient, item.MediaType, playedItem, mediaSource, startPosition, player);
                     streamInfo.aspectRatio = playOptions.aspectRatio;
@@ -2985,14 +3151,12 @@ export class PlaybackManager {
         }
 
         // Chapters and trickplay data belong to the item owning the played media source.
-        function getItemOfMediaSource(apiClient, item, mediaSource, sourceItem) {
+        function getItemOfMediaSource(item, mediaSource, getPlaybackItem) {
             if (!mediaSource.hasAlternateVersions || mediaSource.Id === item.Id) {
                 return Promise.resolve(item);
             }
 
-            const getVersionItem = sourceItem?.Id === mediaSource.Id ?
-                Promise.resolve(sourceItem) :
-                apiClient.getItem(apiClient.getCurrentUserId(), mediaSource.Id).catch(() => null);
+            const getVersionItem = getPlaybackItem(mediaSource.Id).catch(() => null);
 
             return getVersionItem.then(function (versionItem) {
                 if (!versionItem) {
@@ -3010,6 +3174,10 @@ export class PlaybackManager {
 
         function getPlaybackMediaSource(player, apiClient, deviceProfile, item, mediaSourceId, options) {
             options.isPlayback = true;
+
+            // Request the album gain (cached per album) in parallel with the playback info
+            const albumGainPromise = item.AlbumId != null ? getAlbumNormalizationGain(apiClient, item.AlbumId) : null;
+            albumGainPromise?.catch(() => { /* handled below when used */ });
 
             return getPlaybackInfo(player, apiClient, item, deviceProfile, mediaSourceId, null, options).then(function (playbackInfoResult) {
                 if (validatePlaybackInfoResult(self, playbackInfoResult)) {
@@ -3032,9 +3200,9 @@ export class PlaybackManager {
                                     });
                                 });
                             } else {
-                                if (item.AlbumId != null) {
-                                    return apiClient.getItem(apiClient.getCurrentUserId(), item.AlbumId).then(function(result) {
-                                        mediaSource.albumNormalizationGain = result.NormalizationGain;
+                                if (albumGainPromise) {
+                                    return albumGainPromise.then(function (normalizationGain) {
+                                        mediaSource.albumNormalizationGain = normalizationGain;
                                         return mediaSource;
                                     });
                                 }
@@ -3457,7 +3625,8 @@ export class PlaybackManager {
             if (isServerItem(playerStopInfo.item)) {
                 state.PlayState.PositionTicks = (playerStopInfo.positionMs || 0) * 10000;
 
-                reportPlayback(self, state, player, true, playerStopInfo.item.ServerId, 'reportPlaybackStopped');
+                // The queue is reported on start and whenever it changes, not needed again on stop
+                reportPlayback(self, state, player, false, playerStopInfo.item.ServerId, 'reportPlaybackStopped');
             }
 
             state.NextItem = playbackStopInfo.nextItem;
@@ -3568,7 +3737,8 @@ export class PlaybackManager {
                 // only used internally as a safeguard to avoid reporting other events to the server after playback stopped
                 streamInfo.ended = true;
 
-                reportPlayback(self, state, player, true, streamInfo.item.ServerId, 'reportPlaybackStopped');
+                // The queue is reported on start and whenever it changes, not needed again on stop
+                reportPlayback(self, state, player, false, streamInfo.item.ServerId, 'reportPlaybackStopped');
             }
 
             state.NextItem = playbackStopInfo.nextItem;
@@ -3616,6 +3786,10 @@ export class PlaybackManager {
 
             const serverId = self.currentItem(activePlayer).ServerId;
 
+            // When the previous item ended (e.g. auto-advancing to the next item), onPlaybackStopped
+            // already reported the stop and triggered 'playbackstop'
+            const alreadyStopped = !!getPlayerData(activePlayer).streamInfo?.ended;
+
             // User started playing something new while existing content is playing
             let promise;
 
@@ -3636,8 +3810,13 @@ export class PlaybackManager {
 
                 bindStopped(activePlayer);
 
+                if (alreadyStopped) {
+                    return;
+                }
+
                 if (enableLocalPlaylistManagement(activePlayer)) {
-                    reportPlayback(self, state, activePlayer, true, serverId, 'reportPlaybackStopped');
+                    // The queue is reported on start and whenever it changes, not needed again on stop
+                    reportPlayback(self, state, activePlayer, false, serverId, 'reportPlaybackStopped');
                 }
 
                 Events.trigger(self, 'playbackstop', [{
@@ -3658,6 +3837,24 @@ export class PlaybackManager {
 
         function onPlaybackTimeUpdate() {
             const player = this;
+
+            // timeupdate fires several times per second, but progress is only sent every few seconds.
+            // Skip building the player state for ticks close to the last one, except after a jump (seek).
+            const streamInfo = getPlayerData(player).streamInfo;
+            if (streamInfo?.started && !streamInfo.ended) {
+                const now = Date.now();
+                const ticks = getCurrentTicks(player);
+                const last = streamInfo.lastTimeUpdate;
+
+                if (last && now - last.time < TIMEUPDATE_THROTTLE_MS
+                    && Math.abs(ticks - last.ticks - (now - last.time) * 10000) < TIMEUPDATE_SEEK_TICKS
+                ) {
+                    return;
+                }
+
+                streamInfo.lastTimeUpdate = { time: now, ticks };
+            }
+
             sendProgressUpdate(player, 'timeupdate');
         }
 
@@ -3876,7 +4073,17 @@ export class PlaybackManager {
         }
 
         const apiClient = ServerConnections.getApiClient(nextItem.item.ServerId);
-        return apiClient.getItem(apiClient.getCurrentUserId(), nextItem.item.Id);
+        const promise = apiClient.getItem(apiClient.getCurrentUserId(), nextItem.item.Id);
+
+        // Keep the request so that starting the next item does not fetch it again
+        this._nextItemPrefetch = {
+            id: nextItem.item.Id,
+            serverId: nextItem.item.ServerId,
+            time: Date.now(),
+            promise
+        };
+
+        return promise;
     }
 
     canQueue(item) {
@@ -4422,7 +4629,6 @@ export class PlaybackManager {
 }
 
 export const playbackManager = new PlaybackManager();
-bindMediaSegmentManager(playbackManager);
 bindMediaSessionSubscriber(playbackManager);
 
 window.addEventListener('beforeunload', function () {

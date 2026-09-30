@@ -38,11 +38,19 @@ class SkipSegment extends PlaybackSubscriber {
     private skipElement: HTMLButtonElement | null;
     private currentSegment: MediaSegmentDto | null | undefined;
     private hideTimeout: ReturnType<typeof setTimeout> | null | undefined;
+    private hideFrame: number | null;
+    /**
+     * Whether the video OSD is open. SHOW_VIDEO_OSD is only triggered when the OSD visibility changes,
+     * so keep track of it to keep the button shown while the OSD is open.
+     */
+    private isOsdOpen: boolean;
 
     constructor(playbackManager: PlaybackManager) {
         super(playbackManager);
 
         this.skipElement = null;
+        this.hideFrame = null;
+        this.isOsdOpen = false;
         this.onOsdChanged = this.onOsdChanged.bind(this);
     }
 
@@ -85,6 +93,13 @@ class SkipSegment extends PlaybackSubscriber {
             dom.removeEventListener(elem, dom.whichTransitionEvent(), onHideComplete, {
                 once: true
             });
+
+            // Already fully shown (no show/hide animation pending): skip the forced reflow and the animation frame
+            if (this.isSkipButtonShown(elem)) {
+                this.updateShownSkipButton(elem, options);
+                return;
+            }
+
             elem.classList.remove('hide');
             if (!options.animate) {
                 elem.classList.add('no-transition');
@@ -104,10 +119,43 @@ class SkipSegment extends PlaybackSubscriber {
                 elem.classList.remove('skip-button-hidden');
 
                 if (!options.keep) {
-                    this.hideTimeout = setTimeout(this.hideSkipButton.bind(this), 8000);
+                    this.startHideTimeout();
                 }
             });
         }
+    }
+
+    isSkipButtonShown(elem: HTMLButtonElement) {
+        return !elem.classList.contains('hide') && !elem.classList.contains('skip-button-hidden') && this.hideFrame == null;
+    }
+
+    updateShownSkipButton(elem: HTMLButtonElement, options: ShowOptions) {
+        if (!options.animate) {
+            elem.classList.add('no-transition');
+        } else {
+            elem.classList.remove('no-transition');
+        }
+
+        const hasFocus = document.activeElement && focusManager.isCurrentlyFocusable(document.activeElement);
+        if (options.focus && !hasFocus) {
+            focusManager.focus(elem);
+        }
+
+        if (!options.keep) {
+            this.startHideTimeout();
+        }
+    }
+
+    startHideTimeout() {
+        this.hideTimeout = setTimeout(() => {
+            if (this.isOsdOpen) {
+                // Keep the button while the OSD is open, it is hidden with the OSD (see onOsdChanged)
+                this.hideTimeout = null;
+                return;
+            }
+
+            this.hideSkipButton();
+        }, 8000);
     }
 
     hideSkipButton() {
@@ -117,7 +165,9 @@ class SkipSegment extends PlaybackSubscriber {
             // eslint-disable-next-line sonarjs/void-use
             void elem.offsetWidth;
 
-            requestAnimationFrame(() => {
+            if (this.hideFrame != null) cancelAnimationFrame(this.hideFrame);
+            this.hideFrame = requestAnimationFrame(() => {
+                this.hideFrame = null;
                 elem.classList.add('skip-button-hidden');
 
                 dom.addEventListener(elem, dom.whichTransitionEvent(), onHideComplete, {
@@ -135,6 +185,8 @@ class SkipSegment extends PlaybackSubscriber {
     }
 
     onOsdChanged(_e: Event, isOpen: boolean) {
+        this.isOsdOpen = isOpen;
+
         if (this.currentSegment) {
             if (isOpen) {
                 this.showSkipButton({
@@ -194,6 +246,8 @@ class SkipSegment extends PlaybackSubscriber {
         this.hideSkipButton();
         if (!playbackStopInfo.nextItem) {
             Events.off(document, EventType.SHOW_VIDEO_OSD, this.onOsdChanged);
+            // No OSD events are received anymore, don't keep a stale state
+            this.isOsdOpen = false;
         }
     }
 }

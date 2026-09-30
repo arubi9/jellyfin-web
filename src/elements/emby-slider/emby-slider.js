@@ -197,7 +197,11 @@ function updateValues(isValueSet) {
 }
 
 function updateBubble(range, percent, value, bubble) {
-    requestAnimationFrame(function () {
+    // Keep only one bubble update per frame (pointermove/input can fire faster than the display refreshes)
+    cancelAnimationFrame(range.bubbleFrame);
+    range.bubbleFrame = requestAnimationFrame(function () {
+        range.bubbleFrame = null;
+
         const bubbleTrackRect = range.sliderBubbleTrack.getBoundingClientRect();
         const bubbleRect = bubble.getBoundingClientRect();
 
@@ -230,49 +234,45 @@ function updateBubble(range, percent, value, bubble) {
     });
 }
 
-function setMarker(range, valueMarker, marker, valueProgress) {
-    requestAnimationFrame(function () {
-        const bubbleTrackRect = range.sliderBubbleTrack.getBoundingClientRect();
-        const markerRect = marker.getBoundingClientRect();
-
-        if (!bubbleTrackRect.width || !markerRect.width) {
-            // width is not set, most probably because the OSD is currently hidden
-            return;
-        }
-
-        marker.style.left = `calc(${valueMarker}% - ${markerRect.width / 2}px)`;
-
-        if (valueProgress >= valueMarker) {
-            marker.classList.remove('unwatched');
-            marker.classList.add('watched');
-        } else {
-            marker.classList.add('unwatched');
-            marker.classList.remove('watched');
-        }
-    });
+/**
+ * Rebuilds the markers. Markers are positioned once, in percent, and centered by CSS (no layout reads),
+ * so they never have to be measured or moved again for the same marker info.
+ *
+ * @param {HTMLInputElement} range slider itself
+ */
+function renderMarkers(range) {
+    range.markerValues = range.markerInfo.map(marker => mapFractionToValue(range, marker.progress));
+    range.markerContainerElement.innerHTML = range.markerValues.map(valueMarker =>
+        `<span class="sliderMarker" style="left:${valueMarker}%" aria-hidden="true"></span>`
+    ).join('');
+    range.markerElements = range.markerContainerElement.querySelectorAll('.sliderMarker');
+    range.markerWatched = [];
 }
 
-function updateMarkers(range, currentValue) {
+export function updateMarkers(range, currentValue) {
     if (range.getMarkerInfo) {
         const newMarkerInfo = range.getMarkerInfo();
 
-        if (!range.markerInfo || !isEqual(range.markerInfo, newMarkerInfo)) {
+        // getMarkerInfo may return the same (cached) array on every tick - skip the deep comparison then
+        if (range.markerInfo !== newMarkerInfo) {
+            const changed = !isEqual(range.markerInfo, newMarkerInfo);
             range.markerInfo = newMarkerInfo;
-
-            let markersHtml = '';
-            range.markerInfo.forEach(() => {
-                markersHtml += '<span class="sliderMarker" aria-hidden="true"></span>';
-            });
-            range.markerContainerElement.innerHTML = markersHtml;
-
-            range.markerElements = range.markerContainerElement.querySelectorAll('.sliderMarker');
+            if (changed) renderMarkers(range);
         }
     }
 
-    if (range.markerInfo?.length && range.markerElements?.length) {
-        for (let i = 0, length = range.markerElements.length; i < length; i++) {
-            if (range.markerInfo.length > i) {
-                setMarker(range, mapFractionToValue(range, range.markerInfo[i].progress), range.markerElements[i], currentValue);
+    const markerElements = range.markerElements;
+    const markerValues = range.markerValues;
+
+    if (range.markerInfo?.length && markerElements?.length && markerValues) {
+        for (let i = 0, length = markerElements.length; i < length; i++) {
+            const isWatched = currentValue >= markerValues[i];
+
+            // Only touch the DOM when the playback position crosses the marker
+            if (range.markerWatched[i] !== isWatched) {
+                range.markerWatched[i] = isWatched;
+                markerElements[i].classList.toggle('watched', isWatched);
+                markerElements[i].classList.toggle('unwatched', !isWatched);
             }
         }
     }
@@ -644,6 +644,8 @@ EmbySliderPrototype.detachedCallback = function () {
         clearInterval(interval);
     }
     this.interval = null;
+    cancelAnimationFrame(this.bubbleFrame);
+    this.bubbleFrame = null;
     this.backgroundUpper = null;
     this.backgroundLower = null;
 };

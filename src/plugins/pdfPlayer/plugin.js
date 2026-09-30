@@ -66,6 +66,15 @@ export class PdfPlayer {
 
         // cancel page render
         this.cancellationToken = true;
+
+        // release the document and its worker (also aborts a pending download)
+        const downloadTask = this.downloadTask;
+        this.downloadTask = null;
+        this.book = null;
+        this.pages = {};
+        downloadTask?.destroy().catch((err) => {
+            console.error('[PdfPlayer] failed to destroy document', err);
+        });
     }
 
     destroy() {
@@ -151,7 +160,10 @@ export class PdfPlayer {
     }
 
     toggleFullscreen() {
-        setTimeout(() => this.loadPage(this.progress + 1), 200);
+        setTimeout(() => {
+            // the player may have been stopped in the meantime
+            if (this.book) this.loadPage(this.progress + 1);
+        }, 200);
     }
 
     createMediaElement(options) {
@@ -220,8 +232,9 @@ export class PdfPlayer {
                 // https://github.com/mozilla/pdf.js/security/advisories/GHSA-wgrm-67xf-hhpq
                 isEvalSupported: false
             });
+            this.downloadTask = downloadTask;
             return downloadTask.promise.then(book => {
-                if (this.cancellationToken) return;
+                if (this.cancellationToken || this.downloadTask !== downloadTask) return;
                 this.currentSrc = () => downloadHref;
                 this.book = book;
                 this.loaded = true;
@@ -233,6 +246,10 @@ export class PdfPlayer {
                 } else {
                     this.loadPage(1);
                 }
+            }, err => {
+                // the download is aborted when the player is stopped while loading
+                if (this.cancellationToken || this.downloadTask !== downloadTask) return;
+                throw err;
             });
         });
     }
@@ -311,9 +328,14 @@ export class PdfPlayer {
             };
 
             const renderTask = page.render(renderContext);
-            renderTask.promise.then(() => {
+            return renderTask.promise.then(() => {
                 loading.hide();
             });
+        }).catch(err => {
+            // rendering fails once the document is destroyed by stop()
+            if (!this.cancellationToken) {
+                console.error('[PdfPlayer] failed to render page', err);
+            }
         });
     }
 

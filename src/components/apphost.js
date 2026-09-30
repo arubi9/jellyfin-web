@@ -1,4 +1,5 @@
 import appSettings from '../scripts/settings/appSettings';
+import * as userSettings from '../scripts/settings/userSettings';
 import browser from '../scripts/browser';
 import Events from '../utils/events.ts';
 import * as htmlMediaHelper from '../components/htmlMediaHelper';
@@ -48,15 +49,93 @@ function getBaseProfileOptions(item) {
     };
 }
 
+/**
+ * Settings read by the profile builder. They are part of the cache key, so changing a setting
+ * builds a new profile.
+ */
+function getProfileSettingsKey() {
+    return [
+        appSettings.enableDts(),
+        appSettings.enableTrueHd(),
+        appSettings.enableHi10p(),
+        appSettings.alwaysRemuxFlac(),
+        appSettings.alwaysRemuxMp3(),
+        appSettings.disableVbrAudio(),
+        appSettings.get('subtitleburnin'),
+        appSettings.get('subtitlerenderpgs'),
+        userSettings.allowedAudioChannels(),
+        userSettings.preferFmp4HlsContainer(),
+        userSettings.limitSegmentLength(),
+        // Only read by the builder on Xbox
+        browser.xboxOne ? window.screen?.width : null
+    ];
+}
+
+const MAX_CACHED_PROFILES = 10;
+const cachedProfiles = new Map();
+
+function cloneProfile(profile) {
+    // structuredClone is not polyfilled for older browsers (TVs), the profile is plain JSON data
+    if (typeof structuredClone === 'function') {
+        return structuredClone(profile);
+    }
+
+    return JSON.parse(JSON.stringify(profile));
+}
+
+/**
+ * Builds the browser profile, reusing a previous result for the same options and settings.
+ * Building it is expensive (media element creation and many canPlayType checks).
+ * Returns a copy, since callers modify the profile.
+ */
+function buildProfile(options) {
+    let key;
+    let isCacheable = true;
+    try {
+        key = JSON.stringify([options, getProfileSettingsKey()], (_name, value) => {
+            // Functions would be dropped from the key
+            if (typeof value === 'function') {
+                isCacheable = false;
+            }
+            return value;
+        });
+    } catch (err) {
+        console.warn('[apphost] cannot cache the device profile', err);
+        isCacheable = false;
+    }
+
+    if (!isCacheable) {
+        return profileBuilder(options);
+    }
+
+    let profile = cachedProfiles.get(key);
+    if (!profile) {
+        profile = profileBuilder(options);
+
+        if (cachedProfiles.size >= MAX_CACHED_PROFILES) {
+            cachedProfiles.delete(cachedProfiles.keys().next().value);
+        }
+        cachedProfiles.set(key, profile);
+    }
+
+    try {
+        return cloneProfile(profile);
+    } catch (err) {
+        console.warn('[apphost] cannot copy the cached device profile', err);
+        cachedProfiles.delete(key);
+        return profileBuilder(options);
+    }
+}
+
 function getDeviceProfile(item) {
     return new Promise(function (resolve) {
         let profile;
 
         if (window.NativeShell) {
-            profile = window.NativeShell.AppHost.getDeviceProfile(profileBuilder, __PACKAGE_JSON_VERSION__);
+            profile = window.NativeShell.AppHost.getDeviceProfile(buildProfile, __PACKAGE_JSON_VERSION__);
         } else {
             const builderOpts = getBaseProfileOptions(item);
-            profile = profileBuilder(builderOpts);
+            profile = buildProfile(builderOpts);
         }
 
         const maxVideoWidth = appSettings.maxVideoWidth();

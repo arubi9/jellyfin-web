@@ -10,6 +10,9 @@ import { toBoolean } from 'utils/string';
 import browser from '../browser';
 import appSettings from './appSettings';
 
+/** Largest library page size. Matches the max of the page size inputs. */
+const MAX_LIBRARY_PAGE_SIZE = 1000;
+
 const DISPLAY_PREFERENCES_ID = 'usersettings';
 // TODO: We should really update the client ID at some point
 const CLIENT_ID = 'emby';
@@ -520,12 +523,12 @@ export class UserSettings {
         }
 
         const libraryPageSize = parseInt(this.get('libraryPageSize', false), 10);
-        if (libraryPageSize === 0) {
-            // Explicitly return 0 to avoid returning 100 because 0 is falsy.
-            return 0;
-        } else {
-            return libraryPageSize || 100;
+        // Always paginate: loading and rendering an entire large library at once freezes the browser.
+        // 0 (previously "no pagination") and out-of-range values use the maximum page size.
+        if (libraryPageSize === 0 || libraryPageSize > MAX_LIBRARY_PAGE_SIZE) {
+            return MAX_LIBRARY_PAGE_SIZE;
         }
+        return libraryPageSize > 0 ? libraryPageSize : 100;
     }
 
     /**

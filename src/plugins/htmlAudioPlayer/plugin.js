@@ -5,6 +5,7 @@ import { MediaError } from 'types/mediaError';
 import browser from '../../scripts/browser';
 import { appHost } from '../../components/apphost';
 import * as htmlMediaHelper from '../../components/htmlMediaHelper';
+import { appRouter } from '../../components/router/appRouter';
 import profileBuilder from '../../scripts/browserDeviceProfile';
 import { getIncludeCorsCredentials } from '../../scripts/settings/webSettings';
 import Events from '../../utils/events.ts';
@@ -50,14 +51,11 @@ function supportsFade() {
     return !browser.tv;
 }
 
-function requireHlsPlayer(callback) {
-    import('hls.js/dist/hls.js').then(({ default: hls }) => {
-        hls.DefaultConfig.lowLatencyMode = false;
-        hls.DefaultConfig.backBufferLength = Infinity;
-        hls.DefaultConfig.liveBackBufferLength = 90;
-        window.Hls = hls;
+function requireHlsPlayer(callback, onError) {
+    // Memoised import; also sets a finite backBufferLength (see htmlMediaHelper)
+    htmlMediaHelper.loadHlsJs().then(() => {
         callback();
-    });
+    }, onError);
 }
 
 function enableHlsPlayer(url, item, mediaSource, mediaType) {
@@ -65,10 +63,17 @@ function enableHlsPlayer(url, item, mediaSource, mediaType) {
         return Promise.reject();
     }
 
-    if (url.indexOf('.m3u8') !== -1) {
+    const isHlsUrl = htmlMediaHelper.isHlsStreamUrl(url);
+    if (isHlsUrl === true) {
         return Promise.resolve();
     }
 
+    if (isHlsUrl === false) {
+        return Promise.reject();
+    }
+
+    // The universal endpoint decides between direct stream and HLS transcode at request time,
+    // so the content type is only known from the response.
     // issue head request to get content type
     return new Promise(function (resolve, reject) {
         import('../../utils/fetch').then((fetchHelper) => {
@@ -161,6 +166,7 @@ class HtmlAudioPlayer {
             }
 
             htmlMediaHelper.destroyHlsPlayer(self);
+            htmlMediaHelper.cancelSeekOnPlaybackStart(elem);
 
             self._currentPlayOptions = options;
 
@@ -181,6 +187,7 @@ class HtmlAudioPlayer {
 
                         const hls = new Hls({
                             manifestLoadingTimeOut: 20000,
+                            workerPath: `${appRouter.baseUrl()}/libraries/hls.worker.js`,
                             xhrSetup: function (xhr) {
                                 xhr.withCredentials = includeCorsCredentials;
                             }
@@ -193,7 +200,7 @@ class HtmlAudioPlayer {
                         self._hlsPlayer = hls;
 
                         self._currentSrc = val;
-                    });
+                    }, reject);
                 });
             }, async () => {
                 elem.autoplay = true;

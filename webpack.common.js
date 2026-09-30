@@ -10,6 +10,7 @@ const packageJson = require('./package.json');
 
 const Assets = [
     'native-promise-only/npo.js',
+    'hls.js/dist/hls.worker.js',
     'libarchive.js/dist/worker-bundle.js',
     'libarchive.js/dist/libarchive.wasm',
     '@jellyfin/libass-wasm/dist/js/default.woff2',
@@ -144,6 +145,9 @@ const config = {
             maxInitialRequests: Infinity,
             cacheGroups: {
                 node_modules: {
+                    // Only name-split vendor code needed at startup. Naming lazy-only
+                    // modules into the same per-package chunk forces them to load initially.
+                    chunks: 'initial',
                     test(module) {
                         return NODE_MODULES_REGEX.test(module.context);
                     },
